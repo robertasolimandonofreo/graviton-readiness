@@ -393,3 +393,24 @@ func ObservedPools(pods []corev1.PodSpec, known []inventory.NodePool, nodes []in
 	}
 	return out
 }
+
+// OnArm64 reports whether the workload can only land on arm64 nodes: it selects the architecture
+// itself (a node selector or a required node affinity that allows arm64 and not amd64), or every
+// NodePool it can land on provisions only arm64. Such a workload is already on Graviton, so moving
+// it is not part of the migration. A pool that states no architecture does not count: nothing says
+// that its nodes are arm64.
+func OnArm64(pod corev1.PodSpec, pools []inventory.NodePool) bool {
+	if allowsArch(pod, "arm64") && !allowsArch(pod, "amd64") {
+		return true
+	}
+	matched, resolved := selectedPools(pod, pools)
+	if !resolved || len(matched) == 0 {
+		return false
+	}
+	for _, p := range matched {
+		if a := poolArch(p); a.AMD64 || !a.ARM64 {
+			return false
+		}
+	}
+	return true
+}

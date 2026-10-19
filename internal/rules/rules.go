@@ -50,10 +50,12 @@ type ImageStatus struct {
 // Assessment is the result for one workload.
 type Assessment struct {
 	Workload inventory.Workload `json:"-"`
-	Score    int                `json:"score"`
-	Verdict  Verdict            `json:"verdict"`
-	Findings []Finding          `json:"findings"`
-	Images   []ImageStatus      `json:"images,omitempty"`
+	// OnGraviton is true when the workload can only land on arm64 nodes: it is already there.
+	OnGraviton bool          `json:"onGraviton,omitempty"`
+	Score      int           `json:"score"`
+	Verdict    Verdict       `json:"verdict"`
+	Findings   []Finding     `json:"findings"`
+	Images     []ImageStatus `json:"images,omitempty"`
 }
 
 // Score weights: a blocker costs a lot, a caveat a little, info nothing.
@@ -153,6 +155,7 @@ func Evaluate(w inventory.Workload, images map[string]image.Result, opts Options
 		add("GR008", Info, "", "runs on every node, so its images must be multi-arch before any Graviton node joins")
 	}
 
+	a.OnGraviton = OnArm64(w.Pod, opts.NodePools)
 	sortFindings(a.Findings)
 	a.Score, a.Verdict = verdict(a.Findings, unverified)
 	return a

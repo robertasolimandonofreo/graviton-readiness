@@ -262,3 +262,44 @@ func TestObservedPools(t *testing.T) {
 		t.Errorf("a pool selected by name is named by it: %+v", pools)
 	}
 }
+
+func TestOnArm64(t *testing.T) {
+	pools := []inventory.NodePool{
+		pool("arm", map[string]string{"role": "arm"}, arch("In", "arm64")),
+		pool("x86", map[string]string{"role": "x86"}, arch("In", "amd64")),
+		pool("both", map[string]string{"role": "both"}, arch("In", "amd64", "arm64")),
+		pool("silent", map[string]string{"role": "silent"}),
+		pool("graviton", map[string]string{"role": "g"}, inventory.Requirement{Key: instanceFamilyKey, Operator: "In", Values: []string{"m7g", "c7g"}}),
+	}
+	tests := []struct {
+		name string
+		pod  string
+		want bool
+	}{
+		{"an arm64 node selector", "nodeSelector:\n  kubernetes.io/arch: arm64\n", true},
+		{"an amd64 node selector", "nodeSelector:\n  kubernetes.io/arch: amd64\n", false},
+		{"affinity that allows only arm64", affinity("kubernetes.io/arch", "In", "arm64"), true},
+		{"affinity that allows both", affinity("kubernetes.io/arch", "In", "amd64, arm64"), false},
+		{"a pool with only arm64 nodes", "nodeSelector:\n  role: arm\n", true},
+		{"selected by the pool name", "nodeSelector:\n  karpenter.sh/nodepool: arm\n", true},
+		{"a pool with only graviton types", "nodeSelector:\n  role: g\n", true},
+		{"an amd64 pool", "nodeSelector:\n  role: x86\n", false},
+		{"a pool with both", "nodeSelector:\n  role: both\n", false},
+		{"a pool that says nothing is not assumed to be arm64", "nodeSelector:\n  role: silent\n", false},
+		{"nothing selected", "", false},
+		{"a pool that is not known", "nodeSelector:\n  role: nobody\n", false},
+		{"affinity over two pools, one amd64", affinity("karpenter.sh/nodepool", "In", "arm, x86"), false},
+		{"affinity over two arm64 pools", affinity("karpenter.sh/nodepool", "In", "arm, graviton"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := deployment(t, "Deployment", podWith(tt.pod))
+			if got := OnArm64(w.Pod, pools); got != tt.want {
+				t.Errorf("OnArm64 = %v, want %v", got, tt.want)
+			}
+			if got := Evaluate(w, nil, Options{NodePools: pools}).OnGraviton; got != tt.want {
+				t.Errorf("Assessment.OnGraviton = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

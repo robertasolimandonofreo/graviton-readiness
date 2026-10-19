@@ -162,3 +162,34 @@ func TestNothingToPlan(t *testing.T) {
 		t.Errorf("an empty plan: %+v", p.Totals)
 	}
 }
+
+func TestAlreadyOnGravitonIsDoneNotMovable(t *testing.T) {
+	images := map[string]image.Result{"arm:1": {Status: image.Arm64}}
+	arm := inventory.NodePool{Name: "arm", Labels: map[string]string{"role": "arm"}, Requirements: []inventory.Requirement{{Key: "kubernetes.io/arch", Operator: "In", Values: []string{"arm64"}}}}
+	opts := rules.Options{ImagesChecked: true, NodePools: []inventory.NodePool{arm}}
+	onArm := workload(t, "on-arm", 2, "      nodeSelector: {role: arm}\n", "requests: {cpu: 1}", "arm:1")
+	free := workload(t, "free", 1, "", "requests: {cpu: 500m}", "arm:1")
+	var as []rules.Assessment
+	for _, w := range []inventory.Workload{onArm, free} {
+		as = append(as, rules.Evaluate(w, images, opts))
+	}
+	p := plan.Build(as)
+	if got := strings.Join(ids(p.Items, plan.AlreadyOnGraviton), ","); got != "on-arm" {
+		t.Errorf("already on Graviton = %q", got)
+	}
+	if got := strings.Join(ids(p.Items, plan.ReadyNow), ","); got != "free" {
+		t.Errorf("ready now = %q: a workload that is already on arm64 is not a move to make", got)
+	}
+	tot := p.Totals
+	// 2000m already there, 500m left to move: of 2500m requested, 80% is done and 20% is movable.
+	if tot.CPU[plan.AlreadyOnGraviton] != 2000 || tot.OnGravitonPercent != 80 || tot.NowPercent != 20 {
+		t.Errorf("totals: on graviton %d (%d%%), now %d%%", tot.CPU[plan.AlreadyOnGraviton], tot.OnGravitonPercent, tot.NowPercent)
+	}
+	// A workload on arm64 that has a blocker is not "done".
+	bad := workload(t, "broken", 1, "      nodeSelector: {role: arm}\n", "requests: {cpu: 1}", "x86:1")
+	imgs := map[string]image.Result{"x86:1": {Status: image.NoArm64, Platforms: []string{"linux/amd64"}}}
+	q := plan.Build([]rules.Assessment{rules.Evaluate(bad, imgs, opts)})
+	if len(ids(q.Items, plan.AlreadyOnGraviton)) != 0 || len(ids(q.Items, plan.ReadyAfterChanges)) != 1 {
+		t.Errorf("an image without arm64 on an arm64 pool is still a blocker: %+v", q.Totals.Counts)
+	}
+}

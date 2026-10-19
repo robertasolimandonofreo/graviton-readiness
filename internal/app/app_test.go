@@ -505,3 +505,59 @@ func (c countingChecker) Check(ctx context.Context, ref string) image.Result {
 	c.calls.Add(1) // CheckAll asks the registries in parallel
 	return c.inner.Check(ctx, ref)
 }
+
+func TestPlanClusterSeparatesWhatIsAlreadyOnGraviton(t *testing.T) {
+	plan := func(args ...string) (int, string) {
+		var out, errb bytes.Buffer
+		env := Env{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errb, Version: "test",
+			Cluster: clustertest.New(clusterObjects()...), Checker: fakeChecker{"a:1": {Status: image.Arm64}}}
+		return Run(args, env), out.String()
+	}
+	code, out := plan("plan", "--cluster", "--check-images", "-f", "json")
+	if code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	var doc struct {
+		Groups map[string][]struct {
+			Name string `json:"name"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	names := func(g string) []string {
+		var n []string
+		for _, i := range doc.Groups[g] {
+			n = append(n, i.Name)
+		}
+		return n
+	}
+	// on-arm selects a node group whose nodes are all arm64, on-x86 one whose nodes are amd64.
+	if got := strings.Join(names("already-on-graviton"), ","); got != "on-arm" {
+		t.Errorf("already on Graviton = %q", got)
+	}
+	if got := strings.Join(names("ready-after-changes"), ","); got != "on-x86" {
+		t.Errorf("ready after changes = %q", got)
+	}
+	if len(doc.Groups["ready-now"]) != 0 {
+		t.Errorf("what is already on arm64 must not be a move to make: %v", names("ready-now"))
+	}
+	_, table := plan("plan", "--cluster", "--check-images")
+	if !strings.Contains(table, "Already on Graviton:") || !strings.Contains(table, "not counted below") {
+		t.Errorf("the table says it:\n%s", table)
+	}
+	_, scanOut := plan("scan", "--cluster", "--check-images")
+	if !strings.Contains(scanOut, "1 workloads can only land on arm64 nodes: they already run on Graviton.") {
+		t.Errorf("the scan summary says it:\n%s", scanOut)
+	}
+	// Without the images checked nothing is verified: the workload goes to "verify first".
+	_, unchecked := plan("plan", "--cluster", "-f", "json")
+	var d2 struct {
+		Groups map[string][]struct {
+			Name string `json:"name"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(unchecked), &d2); err != nil || len(d2.Groups["already-on-graviton"]) != 0 {
+		t.Errorf("an unverified workload is not done: %v %v", err, d2.Groups["already-on-graviton"])
+	}
+}

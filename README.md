@@ -161,8 +161,10 @@ Ready after a check:      2
 Ready after changes:      24
 Verify first:             5
 Keep on amd64:            2
+Already on Graviton:      7
 
 Requested CPU:            38.0 vCPU
+Already on Graviton:      4.0 vCPU (10%), not counted below
 Movable now:              6.5 vCPU (17%)
 Potential after changes:  31.0 vCPU (81%)
 To verify first:          3.0 vCPU (7%), not counted in the potential
@@ -186,6 +188,9 @@ Phase 2: Ready after changes
 - **Verify first:** nothing blocks it in the configuration, but its images were not checked or the
   registry did not answer. Never counted in the potential.
 - **Keep on amd64:** needs an architecture that Graviton does not have (Windows). No change fixes it.
+- **Already on Graviton:** can only land on arm64 nodes (it selects arm64, or a pool that only has
+  arm64 nodes) and has no blocker. It is done, so it is left out of what remains to move: without
+  this group, the workloads that were already migrated would show up as "ready now".
 
 ## SARIF and code scanning
 

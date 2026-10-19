@@ -26,6 +26,8 @@ type Summary struct {
 	PotentialPercent int                   `json:"potentialPercent"`
 	Unverified       int                   `json:"unverifiedPercent"`
 	Skipped          map[string]int        `json:"skipped,omitempty"`
+	// OnGraviton counts the workloads that can only land on arm64 nodes: they are already there.
+	OnGraviton int `json:"onGraviton"`
 }
 
 // Summarize computes the counts. The CPU figures only cover long-running workloads
@@ -36,6 +38,9 @@ func Summarize(as []rules.Assessment, skipped map[string]int) Summary {
 	s := Summary{Total: len(as), Counts: map[rules.Verdict]int{}, Skipped: skipped}
 	for _, a := range as {
 		s.Counts[a.Verdict]++
+		if a.OnGraviton {
+			s.OnGraviton++
+		}
 		if !a.Workload.LongRunning {
 			continue
 		}
@@ -142,6 +147,9 @@ func summaryText(out io.Writer, s Summary, o Options) error {
 	c := s.Counts
 	fmt.Fprintf(out, "\n%d workloads: %d ready, %d with caveats, %d not ready, %d unverified\n",
 		s.Total, c[rules.Ready], c[rules.ReadyWithCaveats], c[rules.NotReady], c[rules.Unverified])
+	if s.OnGraviton > 0 {
+		fmt.Fprintf(out, "%d workloads can only land on arm64 nodes: they already run on Graviton.\n", s.OnGraviton)
+	}
 	if s.RequestedCPU > 0 {
 		fmt.Fprintf(out, "Graviton potential: %d%% of requested CPU (workloads ready or with caveats).\n", s.PotentialPercent)
 		if s.Unverified > 0 {

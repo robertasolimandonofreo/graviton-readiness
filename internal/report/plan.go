@@ -14,6 +14,7 @@ var groupTitle = map[plan.Group]string{
 	plan.ReadyAfterChanges: "Ready after changes",
 	plan.VerifyFirst:       "Verify first",
 	plan.KeepOnAMD64:       "Keep on amd64",
+	plan.AlreadyOnGraviton: "Already on Graviton",
 }
 
 var groupHelp = map[plan.Group]string{
@@ -22,6 +23,7 @@ var groupHelp = map[plan.Group]string{
 	plan.ReadyAfterChanges: "blockers that a change in the manifest or in the image build removes. The best return for the effort first.",
 	plan.VerifyFirst:       "nothing blocks it in the configuration, but its images were not checked, or the registry did not answer.",
 	plan.KeepOnAMD64:       "needs an architecture that Graviton does not have (Windows). No change fixes it.",
+	plan.AlreadyOnGraviton: "can only land on arm64 nodes (it selects arm64, or a pool that only has arm64 nodes). Done: not part of what is left to move.",
 }
 
 func vcpu(m int64) string { return fmt.Sprintf("%.1f vCPU", float64(m)/1000) }
@@ -44,6 +46,9 @@ func PlanTable(out io.Writer, p plan.Plan, o Options) error {
 	}
 	if t.RequestedCPU > 0 {
 		fmt.Fprintf(out, "\nRequested CPU:            %s\n", vcpu(t.RequestedCPU))
+		if t.CPU[plan.AlreadyOnGraviton] > 0 {
+			fmt.Fprintf(out, "Already on Graviton:      %s (%d%%), not counted below\n", vcpu(t.CPU[plan.AlreadyOnGraviton]), t.OnGravitonPercent)
+		}
 		fmt.Fprintf(out, "Movable now:              %s (%d%%)\n", vcpu(t.CPU[plan.ReadyNow]), t.NowPercent)
 		fmt.Fprintf(out, "Potential after changes:  %s (%d%%)\n", vcpu(t.CPU[plan.ReadyNow]+t.CPU[plan.ReadyAfterCheck]+t.CPU[plan.ReadyAfterChanges]), t.PotentialPercent)
 		if t.CPU[plan.VerifyFirst] > 0 {
@@ -127,8 +132,8 @@ func PlanMarkdown(out io.Writer, p plan.Plan, o Options) error {
 	t := p.Totals
 	fmt.Fprintln(out, "<!-- graviton-readiness-plan -->")
 	fmt.Fprintln(out, "## Graviton migration plan")
-	fmt.Fprintf(out, "\n%d workloads: **%d** ready now, **%d** after a check, **%d** after changes, **%d** to verify first, **%d** to keep on amd64.\n",
-		t.Total, t.Counts[plan.ReadyNow], t.Counts[plan.ReadyAfterCheck], t.Counts[plan.ReadyAfterChanges], t.Counts[plan.VerifyFirst], t.Counts[plan.KeepOnAMD64])
+	fmt.Fprintf(out, "\n%d workloads: **%d** already on Graviton, **%d** ready now, **%d** after a check, **%d** after changes, **%d** to verify first, **%d** to keep on amd64.\n",
+		t.Total, t.Counts[plan.AlreadyOnGraviton], t.Counts[plan.ReadyNow], t.Counts[plan.ReadyAfterCheck], t.Counts[plan.ReadyAfterChanges], t.Counts[plan.VerifyFirst], t.Counts[plan.KeepOnAMD64])
 	if t.RequestedCPU > 0 {
 		fmt.Fprintf(out, "\nMovable now: **%d%%** of the requested CPU. Potential after changes: **%d%%**.", t.NowPercent, t.PotentialPercent)
 		if t.VerifyPercent > 0 {

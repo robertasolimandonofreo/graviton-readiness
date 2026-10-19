@@ -28,10 +28,13 @@ const (
 	// KeepOnAMD64 has a blocker that no change removes: it needs an architecture that Graviton
 	// does not have (Windows).
 	KeepOnAMD64 Group = "keep-on-amd64"
+	// AlreadyOnGraviton can only land on arm64 nodes (it selects arm64 or an arm64-only pool) and
+	// has no blocker: it is done, and moving it is not part of the plan.
+	AlreadyOnGraviton Group = "already-on-graviton"
 )
 
 // Groups lists the groups in the order of the plan.
-var Groups = []Group{ReadyNow, ReadyAfterCheck, ReadyAfterChanges, VerifyFirst, KeepOnAMD64}
+var Groups = []Group{ReadyNow, ReadyAfterCheck, ReadyAfterChanges, VerifyFirst, KeepOnAMD64, AlreadyOnGraviton}
 
 // Change is one thing to do for a workload.
 type Change struct {
@@ -68,6 +71,9 @@ type Totals struct {
 	NowPercent       int `json:"movableNowPercent"`
 	PotentialPercent int `json:"potentialAfterChangesPercent"`
 	VerifyPercent    int `json:"verifyFirstPercent"`
+	// OnGravitonPercent is the CPU that already runs on Graviton, as a share of the requested CPU.
+	// It is not part of the other two: those are about what is left to move.
+	OnGravitonPercent int `json:"alreadyOnGravitonPercent"`
 }
 
 // Plan is the result.
@@ -87,9 +93,15 @@ func Build(as []rules.Assessment) Plan {
 		switch a.Verdict {
 		case rules.Ready:
 			it.Group = ReadyNow
+			if a.OnGraviton {
+				it.Group = AlreadyOnGraviton
+			}
 		case rules.ReadyWithCaveats:
 			it.Group = ReadyAfterCheck
 			it.Changes = changes(a, rules.Caveat)
+			if a.OnGraviton {
+				it.Group = AlreadyOnGraviton
+			}
 		case rules.NotReady:
 			it.Group = ReadyAfterChanges
 			if hasRule(a, "GR009") {
@@ -130,6 +142,7 @@ func Build(as []rules.Assessment) Plan {
 		t.NowPercent = int(100 * now / t.RequestedCPU)
 		t.PotentialPercent = int(100 * (now + check + chg) / t.RequestedCPU)
 		t.VerifyPercent = int(100 * t.CPU[VerifyFirst] / t.RequestedCPU)
+		t.OnGravitonPercent = int(100 * t.CPU[AlreadyOnGraviton] / t.RequestedCPU)
 	}
 	return p
 }
