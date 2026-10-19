@@ -1,0 +1,195 @@
+name: graviton-readiness
+description: Find out which Kubernetes workloads can run on Graviton (arm64) nodes. Scans manifests, checks the image platforms in the registry, comments on the pull request and can upload SARIF.
+author: Roberta Soliman
+branding:
+  icon: server
+  color: blue
+
+inputs:
+  path:
+    description: Files or directories to scan, separated by spaces. Put the NodePool manifests in it too, so the pools that workloads select are checked.
+    default: "."
+  check-images:
+    description: Read the platforms of every image from its registry. The registry credentials are the ones in the Docker config, so log in first (for example with docker/login-action or aws-actions/amazon-ecr-login).
+    default: "false"
+  node-pool:
+    description: Pools that are not Karpenter NodePools, one key=value:arch per line (arch is amd64, arm64 or any), for example eks.amazonaws.com/nodegroup=general:amd64.
+    default: ""
+  fail-on:
+    description: Fail the job when a workload is "not-ready", "unverified" or has "caveats" (each includes the ones before it). Empty never fails.
+    default: ""
+  comment:
+    description: Post (and keep updating) a comment on the pull request with the report.
+    default: "false"
+  comment-plan:
+    description: Also post (and keep updating) a second comment with the migration plan. Needs comment to be true.
+    default: "false"
+  upload-sarif:
+    description: Upload the SARIF report to GitHub code scanning, so findings show on the manifest line. Needs the security-events write permission, which pull requests from forks do not get.
+    default: "false"
+  version:
+    description: graviton-readiness version to run, for example v0.3.0. Defaults to the version of this action when it is used with a version tag, otherwise the latest release. "local" skips the install and uses the graviton-readiness that is already on the PATH.
+    default: ""
+  github-token:
+    description: Token used to comment on the pull request (needs pull-requests write permission).
+    default: ${{ github.token }}
+
+outputs:
+  potential-percent:
+    description: Share of the requested CPU, in long-running workloads, that is ready or ready with caveats with its images verified.
+    value: ${{ steps.scan.outputs.potential-percent }}
+  ready:
+    description: Number of ready workloads.
+    value: ${{ steps.scan.outputs.ready }}
+  caveats:
+    description: Number of workloads ready with caveats.
+    value: ${{ steps.scan.outputs.caveats }}
+  not-ready:
+    description: Number of workloads that are not ready.
+    value: ${{ steps.scan.outputs.not-ready }}
+  unverified:
+    description: Number of workloads whose images were not verified.
+    value: ${{ steps.scan.outputs.unverified }}
+  sarif-file:
+    description: Path of the SARIF report.
+    value: ${{ steps.scan.outputs.sarif-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install graviton-readiness
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        if [ "$INPUT_VERSION" = "local" ]; then
+          command -v graviton-readiness >/dev/null || { echo "::error::version 'local' needs graviton-readiness on the PATH"; exit 1; }
+          echo "Using the graviton-readiness on the PATH"
+          exit 0
+        fi
+        case "$RUNNER_OS_NAME" in
+          Linux) os=linux ;;
+          macOS) os=darwin ;;
+          *) echo "::error::graviton-readiness supports Linux and macOS runners, not $RUNNER_OS_NAME"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH_NAME" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture $RUNNER_ARCH_NAME"; exit 1 ;;
+        esac
+
+        version="$INPUT_VERSION"
+        if [ -z "$version" ] && [[ "$ACTION_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          version="$ACTION_REF"
+        fi
+        if [ -z "$version" ]; then
+          version=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/robertasolimandonofreo/graviton-readiness/releases/latest | jq -r .tag_name)
+        fi
+        [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::invalid version '$version'"; exit 1; }
+
+        archive="graviton-readiness_${version#v}_${os}_${arch}.tar.gz"
+        base="https://github.com/robertasolimandonofreo/graviton-readiness/releases/download/${version}"
+        dir="$RUNNER_TEMP/graviton-readiness"
+        mkdir -p "$dir"
+        curl -fsSL -o "$dir/$archive" "$base/$archive"
+        curl -fsSL -o "$dir/checksums.txt" "$base/checksums.txt"
+        (cd "$dir" && grep " $archive\$" checksums.txt | { sha256sum -c - 2>/dev/null || shasum -a 256 -c -; })
+        tar -xzf "$dir/$archive" -C "$dir" graviton-readiness
+        echo "$dir" >> "$GITHUB_PATH"
+        echo "Installed graviton-readiness $version"
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_CHECK_IMAGES: ${{ inputs.check-images }}
+        INPUT_NODE_POOL: ${{ inputs.node-pool }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_COMMENT_PLAN: ${{ inputs.comment-plan }}
+      run: |
+        set -uo pipefail
+        flags=()
+        [ "$INPUT_CHECK_IMAGES" = "true" ] && flags+=(--check-images)
+        # One --node-pool per line of the input.
+        while IFS= read -r pool; do
+          pool="${pool#"${pool%%[![:space:]]*}"}"
+          pool="${pool%"${pool##*[![:space:]]}"}"
+          [ -n "$pool" ] && flags+=(--node-pool "$pool")
+        done <<< "$INPUT_NODE_POOL"
+        [ -n "$INPUT_FAIL_ON" ] && flags+=(--fail-on "$INPUT_FAIL_ON")
+
+        report="$RUNNER_TEMP/graviton-readiness-report.md"
+        json="$RUNNER_TEMP/graviton-readiness.json"
+        sarif="$RUNNER_TEMP/graviton-readiness.sarif"
+        plan="$RUNNER_TEMP/graviton-readiness-plan.md"
+        # One run writes every report: with --check-images, a second run would ask the registries again.
+        # Word splitting of the path input is intended: it is a space-separated list.
+        # shellcheck disable=SC2086
+        graviton-readiness scan ${flags[@]+"${flags[@]}"} -f markdown --json-file "$json" --sarif-file "$sarif" --plan-file "$plan" $INPUT_PATH > "$report"
+        status=$?
+        # Exit 1 means the fail-on level was reached: still comment, fail afterwards.
+        threshold_failed=false
+        if [ $status -eq 1 ]; then threshold_failed=true
+        elif [ $status -ne 0 ]; then cat "$report"; exit $status; fi
+
+        {
+          echo "potential-percent=$(jq .summary.potentialPercent "$json")"
+          echo "ready=$(jq '.summary.counts.ready // 0' "$json")"
+          echo "caveats=$(jq '.summary.counts["ready-with-caveats"] // 0' "$json")"
+          echo "not-ready=$(jq '.summary.counts["not-ready"] // 0' "$json")"
+          echo "unverified=$(jq '.summary.counts.unverified // 0' "$json")"
+          echo "sarif-file=$sarif"
+          echo "threshold-failed=$threshold_failed"
+        } >> "$GITHUB_OUTPUT"
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        [ "$INPUT_COMMENT_PLAN" = "true" ] && cat "$plan" >> "$GITHUB_STEP_SUMMARY"
+        exit 0
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GH_REPO: ${{ github.repository }}
+        INPUT_COMMENT_PLAN: ${{ inputs.comment-plan }}
+      run: |
+        set -euo pipefail
+        # Each report starts with a marker, so this finds its own comment and not the comment of
+        # another tool (gh pr comment --edit-last would edit whichever was posted last).
+        upsert() {
+          local file="$1" marker="$2" id
+          id=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$id" --field body=@"$file" >/dev/null
+            echo "Updated the comment $id"
+          else
+            gh pr comment "$PR_NUMBER" --body-file "$file"
+          fi
+        }
+        upsert "$RUNNER_TEMP/graviton-readiness-report.md" '<!-- graviton-readiness -->'
+        if [ "$INPUT_COMMENT_PLAN" = "true" ]; then
+          upsert "$RUNNER_TEMP/graviton-readiness-plan.md" '<!-- graviton-readiness-plan -->'
+        fi
+
+    - name: Upload SARIF to code scanning
+      if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+        category: graviton-readiness
+
+    - name: Apply the fail-on level
+      if: steps.scan.outputs.threshold-failed == 'true'
+      shell: bash
+      run: |
+        echo "::error::graviton-readiness reached the fail-on level (see the report above)"
+        exit 1
