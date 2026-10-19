@@ -1,6 +1,8 @@
 package inventory
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -107,5 +109,90 @@ func TestPathsWalksDirectoriesAndStdin(t *testing.T) {
 		if inv.Workloads[i-1].ID() > inv.Workloads[i].ID() {
 			t.Error("workloads are not sorted by ID")
 		}
+	}
+}
+
+func TestDirectoryWalkSkipsFilesThatDoNotParse(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, doc string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("good.yaml", "apiVersion: v1\nkind: Pod\nmetadata: {name: good}\nspec: {containers: [{name: c, image: c:1}]}\n")
+	// A Helm template: valid YAML for the first document, then template syntax.
+	write("template.yaml", "apiVersion: v1\nkind: Pod\nmetadata: {name: half}\nspec: {containers: [{name: c, image: c:1}]}\n---\nmetadata:\n  name: {{ .Release.Name }}\n")
+
+	inv, err := Paths([]string{dir}, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.Workloads) != 1 || inv.Workloads[0].Name != "good" {
+		t.Errorf("workloads = %+v, want only the good pod (nothing from the skipped file)", inv.Workloads)
+	}
+	if len(inv.Unreadable) != 1 || !strings.HasSuffix(inv.Unreadable[0].Path, "template.yaml") {
+		t.Errorf("unreadable = %+v", inv.Unreadable)
+	}
+
+	// The same file named on the command line is an error.
+	if _, err := Paths([]string{filepath.Join(dir, "template.yaml")}, strings.NewReader("")); err == nil {
+		t.Error("an explicit file that does not parse must fail")
+	}
+}
+
+func TestGenerateNameStandsInForTheName(t *testing.T) {
+	inv := load(t, `
+apiVersion: batch/v1
+kind: Job
+metadata: {generateName: migrate-, namespace: nps}
+spec:
+  template: {spec: {containers: [{name: m, image: m:1}]}}
+`)
+	if len(inv.Workloads) != 1 || inv.Workloads[0].ID() != "nps/job/migrate-*" {
+		t.Errorf("workloads = %+v", inv.Workloads)
+	}
+}
+
+func TestNodePools(t *testing.T) {
+	inv := load(t, `
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata: {name: web}
+spec:
+  template:
+    metadata:
+      labels: {role: web}
+    spec:
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: [spot, on-demand]}
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata: {name: default}
+---
+apiVersion: container.example.com/v1
+kind: NodePool
+metadata: {name: not-karpenter}
+spec: {}
+`)
+	if len(inv.NodePools) != 1 {
+		t.Fatalf("pools = %+v, want only the Karpenter one", inv.NodePools)
+	}
+	p := inv.NodePools[0]
+	if p.Name != "web" || p.Labels["role"] != "web" || len(p.Requirements) != 2 || p.Requirements[0].Values[0] != "amd64" {
+		t.Errorf("pool = %+v", p)
+	}
+}
+
+func TestSkippedFileDoesNotLeaveNodePoolsBehind(t *testing.T) {
+	dir := t.TempDir()
+	doc := "apiVersion: karpenter.sh/v1\nkind: NodePool\nmetadata: {name: half}\nspec: {template: {spec: {requirements: []}}}\n---\nmetadata:\n  name: {{ .Release.Name }}\n"
+	if err := os.WriteFile(filepath.Join(dir, "t.yaml"), []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inv, err := Paths([]string{dir}, strings.NewReader(""))
+	if err != nil || len(inv.NodePools) != 0 || len(inv.Unreadable) != 1 {
+		t.Errorf("pools = %+v, unreadable = %+v, err = %v", inv.NodePools, inv.Unreadable, err)
 	}
 }

@@ -60,6 +60,16 @@ type Options struct {
 	Verbose       bool
 	ImagesChecked bool
 	Version       string
+	// Pools is what the NodePool rule saw: the pools read, how many can provision arm64 and the
+	// workloads that pick nodes by a label that no pool answers for.
+	Pools PoolInfo
+}
+
+// PoolInfo summarizes the NodePool side of a scan.
+type PoolInfo struct {
+	Read       int `json:"read"`
+	ARM64      int `json:"arm64"`
+	Unresolved int `json:"workloadsWithUnknownPool"`
 }
 
 func cpu(m int64) string {
@@ -138,6 +148,13 @@ func summaryText(out io.Writer, s Summary, o Options) error {
 			fmt.Fprintf(out, "Unverified: %d%% of requested CPU could move if the images support arm64.\n", s.Unverified)
 		}
 	}
+	if o.Pools.Read > 0 {
+		fmt.Fprintf(out, "NodePools read: %d (%d can provision arm64).\n", o.Pools.Read, o.Pools.ARM64)
+	}
+	if o.Pools.Unresolved > 0 {
+		fmt.Fprintf(out, "%d workloads choose nodes by a label that no scanned NodePool defines, so the architecture of those nodes was not checked. "+
+			"If they are EKS node groups, GKE or AKS pools, or NodePools outside this folder, scan the NodePool manifests too or pass --node-pool key=value:arch.\n", o.Pools.Unresolved)
+	}
 	if !o.ImagesChecked {
 		fmt.Fprintln(out, "Images were not checked: run with --check-images to read their platforms from the registry.")
 	}
@@ -186,9 +203,10 @@ func JSON(out io.Writer, as []rules.Assessment, skipped map[string]int, o Option
 		ToolVersion   string         `json:"toolVersion"`
 		ImagesChecked bool           `json:"imagesChecked"`
 		Summary       Summary        `json:"summary"`
+		NodePools     PoolInfo       `json:"nodePools"`
 		Workloads     []jsonWorkload `json:"workloads"`
 	}{SchemaVersion: SchemaVersion, ToolVersion: o.Version, ImagesChecked: o.ImagesChecked,
-		Summary: Summarize(as, skipped), Workloads: []jsonWorkload{}}
+		Summary: Summarize(as, skipped), NodePools: o.Pools, Workloads: []jsonWorkload{}}
 	for _, a := range as {
 		w := jsonWorkload{
 			ID: a.Workload.ID(), Kind: a.Workload.Kind, Namespace: a.Workload.Namespace,
@@ -221,6 +239,9 @@ func Markdown(out io.Writer, as []rules.Assessment, skipped map[string]int, o Op
 			fmt.Fprintf(out, " Another %d%% is unverified.", s.Unverified)
 		}
 		fmt.Fprintln(out)
+	}
+	if o.Pools.Unresolved > 0 {
+		fmt.Fprintf(out, "\n> %d workloads choose nodes by a label that no scanned NodePool defines: their architecture was not checked. Scan the NodePool manifests too or pass `--node-pool key=value:arch`.\n", o.Pools.Unresolved)
 	}
 	if !o.ImagesChecked {
 		fmt.Fprintln(out, "\n> Images were not checked. Run with `--check-images` to read their platforms from the registry.")

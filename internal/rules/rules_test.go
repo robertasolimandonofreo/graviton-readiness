@@ -172,7 +172,7 @@ func TestCatalogCoversEveryRule(t *testing.T) {
 		seen[r.ID] = true
 	}
 	// Every rule that Evaluate can emit must be documented.
-	for _, id := range []string{"GR001", "GR002", "GR003", "GR004", "GR005", "GR006", "GR007", "GR008", "GR009"} {
+	for _, id := range []string{"GR001", "GR002", "GR003", "GR004", "GR005", "GR006", "GR007", "GR008", "GR009", "GR010", "GR011"} {
 		if _, ok := Lookup(id); !ok {
 			t.Errorf("%s is not in the catalog", id)
 		}

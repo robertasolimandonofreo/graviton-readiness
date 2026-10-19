@@ -80,6 +80,9 @@ var x86Hint = regexp.MustCompile(`(?i)(amd64|x86[_-]64)`)
 type Options struct {
 	// ImagesChecked says whether the registry was consulted. Without it, images are unverified.
 	ImagesChecked bool
+	// NodePools are the Karpenter NodePools found in the scanned manifests. Without any, the
+	// pools a workload selects are not checked.
+	NodePools []inventory.NodePool
 }
 
 // Evaluate applies every rule to a workload. images maps an image reference to what the registry
@@ -101,6 +104,13 @@ func Evaluate(w inventory.Workload, images map[string]image.Result, opts Options
 		add("GR009", Blocker, "targets Windows nodes, which Graviton does not have")
 	}
 	pinned := !allowsArch(w.Pod, "arm64")
+	// A pod that selects a NodePool has that pool's architecture. When the pod already pins
+	// amd64 itself (GR001) the pool adds nothing to say.
+	if !pinned {
+		if rule, sev, msg := poolFindings(w.Pod, opts.NodePools); rule != "" {
+			add(rule, sev, "%s", msg)
+		}
+	}
 
 	// Images.
 	unverified := false

@@ -114,6 +114,25 @@ args: ["curl -L https://example.com/tool_linux_$(dpkg --print-architecture) -o /
 		Example: `nodeSelector:
   kubernetes.io/os: windows`,
 	},
+	{
+		ID: "GR010", Severity: Blocker,
+		Title: "Selects a NodePool that only provisions amd64",
+		Why:   "The pod points at a Karpenter NodePool (by karpenter.sh/nodepool, or by a label that the pool puts on its nodes), and that pool only creates x86 nodes. The pod itself says nothing about the architecture, so the image can be multi-arch and the workload still never reaches a Graviton node. The pool is amd64-only when its requirements say so (kubernetes.io/arch) or list only x86 instance types.",
+		Fix:   "Point the workload at a NodePool that can provision arm64, or create one (kubernetes.io/arch In [arm64] with Graviton families such as m7g or c7g), and move the selector. Do it after the images are multi-arch (see GR004).",
+		Example: `# problem
+nodeSelector:
+  karpenter.sh/nodepool: prod-app    # prod-app: kubernetes.io/arch In [amd64]
+# fix
+nodeSelector:
+  karpenter.sh/nodepool: prod-app-arm64`,
+	},
+	{
+		ID: "GR011", Severity: Info,
+		Title:   "Selects a NodePool that is not among the scanned manifests",
+		Why:     "The pod selects a pool by name or by label, and no NodePool with that name or label was found in the scanned files, so its architecture is unknown.",
+		Fix:     "Scan the folder that holds your NodePool manifests too, for example scan ./k8s ./karpenter.",
+		Example: `graviton-readiness scan ./k8s ./karpenter`,
+	},
 }
 
 // Lookup finds a rule by ID.

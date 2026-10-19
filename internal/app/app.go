@@ -48,6 +48,9 @@ Scan flags:
   -v, --verbose                        print every finding
       --timeout <duration>             limit for one registry lookup (default 20s)
       --concurrency <n>                registry lookups at a time (default 8)
+      --node-pool <key=value:arch>     the architecture (amd64, arm64 or any) of nodes labeled key=value, for
+                                       pools that are not Karpenter NodePools (EKS node groups, GKE or AKS
+                                       pools); may be repeated
 `
 
 // Run executes one command line and returns the process exit code.
@@ -82,7 +85,14 @@ type scanFlags struct {
 	verbose     bool
 	timeout     string
 	concurrency int
+	nodePools   poolFlags
 }
+
+// poolFlags collects every --node-pool, which may be repeated.
+type poolFlags []string
+
+func (p *poolFlags) String() string     { return strings.Join(*p, ",") }
+func (p *poolFlags) Set(v string) error { *p = append(*p, v); return nil }
 
 // parseInterspersed parses flags that may come before or after the paths, which the standard
 // flag package does not do by itself: it stops at the first non-flag argument.
@@ -113,6 +123,7 @@ func scan(args []string, env Env) int {
 	fs.BoolVar(&f.verbose, "v", false, "")
 	fs.StringVar(&f.timeout, "timeout", "20s", "")
 	fs.IntVar(&f.concurrency, "concurrency", 8, "")
+	fs.Var(&f.nodePools, "node-pool", "")
 	paths, err := parseInterspersed(fs, args)
 	if err != nil {
 		return exitUsage
@@ -139,6 +150,20 @@ func scan(args []string, env Env) int {
 		fmt.Fprintln(env.Stderr, "error:", err)
 		return exitUsage
 	}
+	if n := len(inv.Unreadable); n > 0 {
+		shown := inv.Unreadable
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		fmt.Fprintf(env.Stderr, "warning: skipped %d files that are not valid Kubernetes YAML (Helm templates, for example); first: ", n)
+		for i, u := range shown {
+			if i > 0 {
+				fmt.Fprint(env.Stderr, ", ")
+			}
+			fmt.Fprint(env.Stderr, u.Path)
+		}
+		fmt.Fprintln(env.Stderr)
+	}
 	if len(inv.Workloads) == 0 {
 		// Not an error, but a typo in the path would otherwise pass a CI check silently.
 		fmt.Fprintf(env.Stderr, "warning: no workloads found in %s (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Pods are read)\n", strings.Join(paths, ", "))
@@ -160,13 +185,29 @@ func scan(args []string, env Env) int {
 		results = image.CheckAll(ctx, checker, rules.ImageRefs(inv.Workloads), f.concurrency)
 	}
 
-	opts := rules.Options{ImagesChecked: f.checkImages}
+	pools := inv.NodePools
+	for _, spec := range f.nodePools {
+		pool, err := rules.ParsePool(spec)
+		if err != nil {
+			fmt.Fprintln(env.Stderr, "error:", err)
+			return exitUsage
+		}
+		pools = append(pools, pool)
+	}
+	opts := rules.Options{ImagesChecked: f.checkImages, NodePools: pools}
 	assessments := make([]rules.Assessment, 0, len(inv.Workloads))
 	for _, w := range inv.Workloads {
 		assessments = append(assessments, rules.Evaluate(w, results, opts))
 	}
 
-	ro := report.Options{Verbose: f.verbose, ImagesChecked: f.checkImages, Version: env.Version}
+	info := report.PoolInfo{}
+	info.Read, info.ARM64 = rules.PoolCounts(pools)
+	for _, w := range inv.Workloads {
+		if rules.PoolUnknown(w.Pod, pools) {
+			info.Unresolved++
+		}
+	}
+	ro := report.Options{Verbose: f.verbose, ImagesChecked: f.checkImages, Version: env.Version, Pools: info}
 	var werr error
 	switch f.format {
 	case "json":

@@ -107,9 +107,40 @@ counts what the manifests and the registry show.
 | GR007 | Caveat   | Requests a GPU                                                                       |
 | GR008 | Info     | DaemonSet: runs on every node, so its images must be multi-arch first                |
 | GR009 | Blocker  | Targets Windows nodes                                                                |
+| GR010 | Blocker  | Selects a Karpenter NodePool that only provisions amd64 (see [NodePools](#nodepools)) |
+| GR011 | Info     | Selects a NodePool that is not among the scanned manifests                           |
 
 Init containers are checked like the others. `graviton-readiness explain GR004` documents any rule,
 with a problem and a fix.
+
+## NodePools
+
+A pod that picks its nodes by `karpenter.sh/nodepool`, or by a label that its NodePool puts on the
+nodes (`role: web`), has the architecture of that pool, and the pod itself says nothing about it.
+So the image can be multi-arch and the workload still never reaches a Graviton node. When the
+scanned files include Karpenter `NodePool` manifests, GR010 links each workload to the pools it can
+land on (through its node selector and its required node affinity) and reports it when none of
+them can provision arm64. A pool is amd64-only when its requirements say so
+(`kubernetes.io/arch In [amd64]`), or list only x86 instance types or families.
+
+```bash
+graviton-readiness scan ./k8s ./karpenter     # the workloads and the NodePools together
+```
+
+A pool that states no architecture is **not** assumed to be amd64: the Karpenter documentation does
+not promise a default, so the rule stays quiet unless the manifest proves it.
+
+**What if there is no NodePool in the scan?** Then the rule does not run, and the tool says so: the
+summary counts the workloads that choose nodes by a label no scanned pool defines ("N workloads
+choose nodes by a label that no scanned NodePool defines"). That is the case when the pools are not
+Karpenter's (an EKS managed node group, a GKE or AKS node pool) or live outside the folder. Declare
+them yourself, one per `--node-pool`, as `key=value:arch` with `amd64`, `arm64` or `any`:
+
+```bash
+graviton-readiness scan ./k8s \
+  --node-pool eks.amazonaws.com/nodegroup=general:amd64 \
+  --node-pool cloud.google.com/gke-nodepool=arm-pool:arm64
+```
 
 ## What the numbers mean
 
@@ -138,8 +169,10 @@ entry per workload with its score, verdict, findings and image statuses.
   image was published for arm64, not that it works.
 - **Performance and cost are out of scope.** It does not measure whether Graviton is cheaper for
   your workload, only whether it can run there.
-- Manifests only: it does not read a live cluster, Karpenter NodePools or Helm values yet.
-  Render charts with `helm template` and pipe them in.
+- Manifests only: it does not read a live cluster or Helm values yet. Render charts with
+  `helm template` and pipe them in. Only Karpenter NodePools are read from manifests: other pools
+  are declared with `--node-pool`. EC2NodeClass is not read, so an AMI that decides the
+  architecture is not seen.
 - Rules are heuristics. GR006 looks for the text `amd64` or `x86_64`, so it can miss a hidden
   architecture or flag a harmless mention.
 - AWS first: the instance-type rules know Graviton families (m7g, c6gn, x2gd, im4gn, is4gen, g5g,
@@ -147,9 +180,9 @@ entry per workload with its score, verdict, findings and image statuses.
 
 ## Roadmap
 
-Reading a live cluster (read-only), checking Karpenter NodePools and EC2NodeClasses, a GitHub
-Action with a pull request comment, SARIF, and a migration plan that groups what to move now and
-after changes. None of it is started.
+Reading a live cluster (read-only), reading EC2NodeClasses, a GitHub Action with a pull request
+comment, SARIF, and a migration plan that groups what to move now and after changes. None of it is
+started.
 
 ## Related
 

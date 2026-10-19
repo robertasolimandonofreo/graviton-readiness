@@ -162,3 +162,112 @@ func TestEmptyScanWarns(t *testing.T) {
 		t.Errorf("exit=%d stderr=%q", code, errOut)
 	}
 }
+
+const poolManifests = `
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata: {name: web}
+spec:
+  template:
+    metadata: {labels: {role: web}}
+    spec:
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api}
+spec:
+  template:
+    spec:
+      nodeSelector: {role: web}
+      containers: [{name: c, image: c:1}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: managed}
+spec:
+  template:
+    spec:
+      nodeSelector: {eks.amazonaws.com/nodegroup: general}
+      containers: [{name: c, image: c:1}]
+`
+
+func TestNodePoolRuleAndNote(t *testing.T) {
+	code, out, _ := run(t, poolManifests, nil, "scan", "-", "-v")
+	if code != exitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	for _, want := range []string{"GR010", "only provisions amd64", "NodePools read: 1 (0 can provision arm64)", "1 workloads choose nodes by a label that no scanned NodePool defines", "--node-pool"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// poolRules scans the manifests and returns, per workload, the NodePool rules it got.
+func poolRules(t *testing.T, args ...string) map[string][]string {
+	t.Helper()
+	code, out, _ := run(t, poolManifests, nil, append([]string{"scan", "-", "-f", "json"}, args...)...)
+	if code != exitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	var doc struct {
+		Workloads []struct {
+			Name     string `json:"name"`
+			Findings []struct {
+				Rule string `json:"rule"`
+			} `json:"findings"`
+		} `json:"workloads"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, w := range doc.Workloads {
+		for _, f := range w.Findings {
+			if f.Rule == "GR010" || f.Rule == "GR011" {
+				got[w.Name] = append(got[w.Name], f.Rule)
+			}
+		}
+	}
+	return got
+}
+
+func TestNodePoolFlagDeclaresAPoolThatIsNotKarpenter(t *testing.T) {
+	// Only the Karpenter NodePool is known: api is pinned to it, managed is not resolved.
+	if got := poolRules(t); len(got) != 1 || got["api"][0] != "GR010" {
+		t.Errorf("without the flag: %v", got)
+	}
+	// Declaring the EKS node group as amd64 pins managed too.
+	if got := poolRules(t, "--node-pool", "eks.amazonaws.com/nodegroup=general:amd64"); got["api"][0] != "GR010" || got["managed"][0] != "GR010" {
+		t.Errorf("amd64 node group: %v", got)
+	}
+	// Declared arm64, managed is fine, and api keeps its finding.
+	if got := poolRules(t, "--node-pool", "eks.amazonaws.com/nodegroup=general:arm64"); len(got) != 1 || got["api"][0] != "GR010" {
+		t.Errorf("arm64 node group: %v", got)
+	}
+	_, out, _ := run(t, poolManifests, nil, "scan", "-", "--node-pool", "eks.amazonaws.com/nodegroup=general:amd64")
+	if strings.Contains(out, "choose nodes by a label") {
+		t.Errorf("every label is now known, the note should be gone:\n%s", out)
+	}
+}
+
+func TestNodePoolFlagErrorsAndJSON(t *testing.T) {
+	for _, bad := range []string{"role", "role=web", "role=web:sparc"} {
+		if code, _, _ := run(t, poolManifests, nil, "scan", "-", "--node-pool", bad); code != exitUsage {
+			t.Errorf("--node-pool %q: exit = %d, want %d", bad, code, exitUsage)
+		}
+	}
+	_, out, _ := run(t, poolManifests, nil, "scan", "-", "-f", "json")
+	var doc struct {
+		NodePools struct {
+			Read       int `json:"read"`
+			ARM64      int `json:"arm64"`
+			Unresolved int `json:"workloadsWithUnknownPool"`
+		} `json:"nodePools"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil || doc.NodePools.Read != 1 || doc.NodePools.ARM64 != 0 || doc.NodePools.Unresolved != 1 {
+		t.Errorf("nodePools = %+v, err = %v", doc.NodePools, err)
+	}
+}

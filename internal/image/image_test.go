@@ -80,6 +80,8 @@ func TestRegistryCheck(t *testing.T) {
 		{host + "/app:single-x86", NoArm64},
 		{host + "/app:missing", Unknown},
 		{"${REGISTRY}/app:1", Unknown},
+		{"__IMAGE__", Unknown},
+		{"registry.example.com/app:__TAG__", Unknown},
 		{"not a ref!", Unknown},
 	}
 	for _, tt := range tests {

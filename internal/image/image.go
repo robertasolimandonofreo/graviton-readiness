@@ -5,6 +5,7 @@ package image
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -37,6 +38,9 @@ type Result struct {
 	// Reason explains an Unknown status.
 	Reason string
 }
+
+// placeholder matches the markers that a CI step replaces before the deploy, such as __IMAGE__.
+var placeholder = regexp.MustCompile(`__[A-Za-z0-9_]+__`)
 
 // Checker resolves image references to a Result.
 type Checker interface {
@@ -78,7 +82,7 @@ func (r *Registry) Check(ctx context.Context, ref string) Result {
 }
 
 func (r *Registry) lookup(ctx context.Context, ref string) Result {
-	if strings.ContainsAny(ref, "${}") {
+	if strings.ContainsAny(ref, "${}") || placeholder.MatchString(ref) {
 		return Result{Status: Unknown, Reason: "not a literal image reference"}
 	}
 	parsed, err := name.ParseReference(ref)

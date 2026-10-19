@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -56,6 +57,37 @@ type Inventory struct {
 	// Skipped counts objects that were read but are not analyzed, by kind (for example
 	// ReplicaSets, which belong to a Deployment).
 	Skipped map[string]int
+	// Unreadable lists the files found while walking a directory that could not be parsed as
+	// Kubernetes manifests (a Helm template, for example). They are skipped, not fatal. A file
+	// given on the command line that cannot be parsed is an error instead.
+	Unreadable []Unreadable
+	// NodePools are the Karpenter NodePools found next to the workloads. A workload that selects
+	// a pool by label has the architecture of that pool, which the pod itself does not say.
+	NodePools []NodePool
+}
+
+// NodePool is the part of a Karpenter NodePool that decides which nodes it can provision.
+type NodePool struct {
+	Name         string
+	Labels       map[string]string
+	Requirements []Requirement
+	File         string
+	// LabelOnly marks a pool declared by label (--node-pool role=web:amd64): it has no name that
+	// karpenter.sh/nodepool could select.
+	LabelOnly bool
+}
+
+// Requirement is one entry of spec.template.spec.requirements.
+type Requirement struct {
+	Key      string
+	Operator string
+	Values   []string
+}
+
+// Unreadable is a file that was skipped, and why.
+type Unreadable struct {
+	Path   string
+	Reason string
 }
 
 // Paths loads every .yaml, .yml and .json file under the given paths. "-" reads stdin.
@@ -88,8 +120,15 @@ func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 			if err != nil {
 				return err
 			}
+			// A file named on the command line must parse. One found in a directory may be
+			// a template or a values file, so it is skipped, and nothing it held is kept.
+			before, pools, skipped := len(inv.Workloads), len(inv.NodePools), maps.Clone(inv.Skipped)
 			if err := inv.Add(path, data); err != nil {
-				return fmt.Errorf("%s: %w", path, err)
+				if path == p {
+					return fmt.Errorf("%s: %w", path, err)
+				}
+				inv.Workloads, inv.NodePools, inv.Skipped = inv.Workloads[:before], inv.NodePools[:pools], skipped
+				inv.Unreadable = append(inv.Unreadable, Unreadable{Path: path, Reason: firstLine(err)})
 			}
 			return nil
 		})
@@ -144,6 +183,10 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 		if w.Namespace == "" {
 			w.Namespace = "default"
 		}
+		if w.Name == "" && om.GenerateName != "" {
+			// Created with generateName, so the real name does not exist until it runs.
+			w.Name = om.GenerateName + "*"
+		}
 		if replicas != nil {
 			w.Replicas = *replicas
 		}
@@ -196,11 +239,46 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 			return err
 		}
 		add("Pod", o.ObjectMeta, nil, true, o.Spec)
+	case "NodePool":
+		// Only Karpenter's: other projects have a kind with the same name.
+		if !strings.HasPrefix(meta.APIVersion, "karpenter.sh/") {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				Template struct {
+					Metadata struct {
+						Labels map[string]string `json:"labels"`
+					} `json:"metadata"`
+					Spec struct {
+						Requirements []struct {
+							Key      string   `json:"key"`
+							Operator string   `json:"operator"`
+							Values   []string `json:"values"`
+						} `json:"requirements"`
+					} `json:"spec"`
+				} `json:"template"`
+			} `json:"spec"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		pool := NodePool{Name: o.Metadata.Name, Labels: o.Spec.Template.Metadata.Labels, File: file}
+		for _, r := range o.Spec.Template.Spec.Requirements {
+			pool.Requirements = append(pool.Requirements, Requirement{Key: r.Key, Operator: r.Operator, Values: r.Values})
+		}
+		inv.NodePools = append(inv.NodePools, pool)
 	case "ReplicaSet", "ReplicationController":
 		// Owned by a Deployment in practice: counted so the report can say what was left out.
 		inv.Skipped[meta.Kind]++
 	}
 	return nil
+}
+
+func firstLine(err error) string {
+	msg, _, _ := strings.Cut(err.Error(), "\n")
+	return msg
 }
 
 // cpuRequest sums the CPU requests of the app containers, in millicores. Init containers run
