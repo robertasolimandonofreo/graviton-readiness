@@ -271,3 +271,21 @@ func TestNodePoolFlagErrorsAndJSON(t *testing.T) {
 		t.Errorf("nodePools = %+v, err = %v", doc.NodePools, err)
 	}
 }
+
+func TestSARIFFormat(t *testing.T) {
+	code, out, _ := run(t, "", nil, "scan", sample, "-f", "sarif")
+	if code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	var doc struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Results []struct {
+				RuleID string `json:"ruleId"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil || doc.Version != "2.1.0" || len(doc.Runs[0].Results) == 0 {
+		t.Errorf("%v: %.200s", err, out)
+	}
+}

@@ -5,13 +5,13 @@ package inventory
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -19,7 +19,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"sigs.k8s.io/yaml"
 )
 
 // Workload is a pod-creating object, with its pod template.
@@ -35,6 +35,33 @@ type Workload struct {
 	LongRunning bool
 	Pod         corev1.PodSpec
 	File        string
+	// Line is the line of the file where the document of this workload starts, and Doc is its
+	// text: together they let a finding point at the line of the field that caused it. Both are
+	// empty for a workload read from a cluster.
+	Line int
+	Doc  string
+}
+
+// LineOf returns the line of the file of the first line of the document that contains substr
+// (case-insensitive), or the line of its kind: when there is none. 0 means there is no file.
+func (w Workload) LineOf(substr string) int {
+	if w.Doc == "" || w.Line == 0 {
+		return 0
+	}
+	lines := strings.Split(w.Doc, "\n")
+	if needle := strings.ToLower(substr); needle != "" {
+		for i, l := range lines {
+			if strings.Contains(strings.ToLower(l), needle) {
+				return w.Line + i
+			}
+		}
+	}
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "kind:") {
+			return w.Line + i
+		}
+	}
+	return w.Line
 }
 
 // ID is the display name, namespace/kind/name in lower case, like kubectl output.
@@ -140,28 +167,65 @@ func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 	return inv, nil
 }
 
+// New returns an empty inventory.
+func New() *Inventory { return &Inventory{Skipped: map[string]int{}} }
+
+// AddJSON adds one object that is already JSON (an object listed from a cluster). file is only
+// used to say where it came from.
+func (inv *Inventory) AddJSON(file string, raw []byte) error {
+	return inv.addObject(source{file: file}, raw)
+}
+
+// Sort orders the workloads by ID, so the output does not depend on where each one came from.
+func (inv *Inventory) Sort() {
+	sort.SliceStable(inv.Workloads, func(i, j int) bool { return inv.Workloads[i].ID() < inv.Workloads[j].ID() })
+}
+
+// docSeparator is a YAML document separator on a line of its own.
+var docSeparator = regexp.MustCompile(`(?m)^---[ \t]*$`)
+
+// source says where an object came from.
+type source struct {
+	file string
+	line int    // the line of the file where its document starts, 0 when there is no file
+	doc  string // the text of its document
+}
+
 // Add parses a multi-document YAML (or JSON) stream. file is only used to say where a workload
-// came from.
+// came from, and each document remembers the line where it starts.
 func (inv *Inventory) Add(file string, data []byte) error {
-	dec := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
-	for {
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
+	text := string(data)
+	seps := docSeparator.FindAllStringIndex(text, -1)
+	start := 0
+	for i := 0; i <= len(seps); i++ {
+		end := len(text)
+		if i < len(seps) {
+			end = seps[i][0]
+		}
+		doc := text[start:end]
+		// The first line of a document that follows a separator is the separator's own line.
+		line := 1 + strings.Count(text[:start], "\n")
+		if i < len(seps) {
+			start = seps[i][1]
+		}
+		if strings.TrimSpace(doc) == "" {
+			continue
+		}
+		raw, err := yaml.YAMLToJSON([]byte(doc))
+		if err != nil {
 			return err
 		}
 		if len(bytes.TrimSpace(raw)) == 0 || string(raw) == "null" {
 			continue
 		}
-		if err := inv.addObject(file, raw); err != nil {
+		if err := inv.addObject(source{file: file, line: line, doc: doc}, raw); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
-func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
+func (inv *Inventory) addObject(src source, raw json.RawMessage) error {
 	var meta struct {
 		metav1.TypeMeta `json:",inline"`
 		Items           []json.RawMessage `json:"items"`
@@ -178,7 +242,9 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 			Replicas:    1,
 			LongRunning: long,
 			Pod:         pod,
-			File:        file,
+			File:        src.file,
+			Line:        src.line,
+			Doc:         src.doc,
 		}
 		if w.Namespace == "" {
 			w.Namespace = "default"
@@ -199,7 +265,7 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 		// Not a Kubernetes object (for example a values file): ignore it.
 	case "List":
 		for _, item := range meta.Items {
-			if err := inv.addObject(file, item); err != nil {
+			if err := inv.addObject(src, item); err != nil {
 				return err
 			}
 		}
@@ -264,7 +330,7 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 		if err := decode(&o); err != nil {
 			return err
 		}
-		pool := NodePool{Name: o.Metadata.Name, Labels: o.Spec.Template.Metadata.Labels, File: file}
+		pool := NodePool{Name: o.Metadata.Name, Labels: o.Spec.Template.Metadata.Labels, File: src.file}
 		for _, r := range o.Spec.Template.Spec.Requirements {
 			pool.Requirements = append(pool.Requirements, Requirement{Key: r.Key, Operator: r.Operator, Values: r.Values})
 		}
