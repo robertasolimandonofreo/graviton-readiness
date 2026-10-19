@@ -10,12 +10,31 @@ DaemonSets, Jobs, CronJobs and Pods and checks the two things that decide it: wh
 scheduling configuration lets the pod reach an arm64 node, and whether every image was published
 for `linux/arm64`.
 
-> **Status: early (v0.1).** It scans YAML/JSON manifests, and can read the platforms of the
+> **Status: early (v0.1.0).** It scans YAML/JSON manifests, and can read the platforms of the
 > images from their registries. It is a static analysis, not a guarantee: see [Limits](#limits).
 
 ## Install
 
-Build it with Go (a release with binaries and a container image comes with the first tag):
+Download a binary for Linux, macOS or Windows (amd64 and arm64) from the
+[releases page](https://github.com/robertasolimandonofreo/graviton-readiness/releases), and check it
+against `checksums.txt`:
+
+```bash
+tar -xzf graviton-readiness_<version>_linux_amd64.tar.gz
+sha256sum -c --ignore-missing checksums.txt
+sudo mv graviton-readiness /usr/local/bin/
+```
+
+Or use the container image (linux/amd64 and linux/arm64):
+
+```bash
+docker run --rm -v "$PWD:/work:ro" ghcr.io/robertasolimandonofreo/graviton-readiness:latest scan /work
+```
+
+The image only reads the files you mount, and has no Docker config, so `--check-images` only
+reaches public registries from it. For private registries use the binary.
+
+Or build it with Go:
 
 ```bash
 go install github.com/robertasolimandonofreo/graviton-readiness/cmd/graviton-readiness@latest
