@@ -139,6 +139,10 @@ func scan(args []string, env Env) int {
 		fmt.Fprintln(env.Stderr, "error:", err)
 		return exitUsage
 	}
+	if len(inv.Workloads) == 0 {
+		// Not an error, but a typo in the path would otherwise pass a CI check silently.
+		fmt.Fprintf(env.Stderr, "warning: no workloads found in %s (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Pods are read)\n", strings.Join(paths, ", "))
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

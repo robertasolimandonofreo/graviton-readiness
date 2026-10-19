@@ -154,3 +154,11 @@ func TestExplainAndVersion(t *testing.T) {
 		t.Errorf("version output = %q", out)
 	}
 }
+
+func TestEmptyScanWarns(t *testing.T) {
+	dir := t.TempDir()
+	code, _, errOut := run(t, "", nil, "scan", dir)
+	if code != exitOK || !strings.Contains(errOut, "no workloads found") {
+		t.Errorf("exit=%d stderr=%q", code, errOut)
+	}
+}
