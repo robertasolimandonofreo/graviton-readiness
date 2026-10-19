@@ -10,8 +10,9 @@ DaemonSets, Jobs, CronJobs and Pods and checks the two things that decide it: wh
 scheduling configuration lets the pod reach an arm64 node, and whether every image was published
 for `linux/arm64`.
 
-> **Status: early (v0.1.0).** It scans YAML/JSON manifests, and can read the platforms of the
-> images from their registries. It is a static analysis, not a guarantee: see [Limits](#limits).
+> **Status: early (v0.3.0).** It scans YAML/JSON manifests or a live cluster (read-only), reads the
+> platforms of the images from their registries, and plans the migration. It is a static analysis
+> of configuration, not a guarantee: see [Limits](#limits).
 
 ## Install
 
@@ -49,6 +50,9 @@ helm template my-release ./chart | graviton-readiness scan -
 graviton-readiness scan --check-images ./k8s           # also read the image platforms
 graviton-readiness scan -f json ./k8s                  # machine-readable
 graviton-readiness scan -f markdown ./k8s              # for a pull request comment
+graviton-readiness scan -f sarif ./k8s > gr.sarif      # for GitHub code scanning
+graviton-readiness plan --check-images ./k8s ./karpenter   # what to move now, after changes, or never
+graviton-readiness scan --cluster                      # a live cluster, read-only
 graviton-readiness scan --check-images --fail-on not-ready ./k8s   # exit 1 in CI
 graviton-readiness explain GR004                       # what a rule means and how to fix it
 ```
@@ -142,6 +146,131 @@ graviton-readiness scan ./k8s \
   --node-pool cloud.google.com/gke-nodepool=arm-pool:arm64
 ```
 
+## Migration plan
+
+`graviton-readiness plan` turns the verdicts into an order of work. It takes the same input as
+`scan` (paths, `--check-images`, `--node-pool`, `--cluster`) and `-f table`, `json` or `markdown`.
+Illustrative output, with made-up numbers:
+
+```
+GRAVITON MIGRATION PLAN
+
+Total workloads:          42
+Ready now:                9
+Ready after a check:      2
+Ready after changes:      24
+Verify first:             5
+Keep on amd64:            2
+
+Requested CPU:            38.0 vCPU
+Movable now:              6.5 vCPU (17%)
+Potential after changes:  31.0 vCPU (81%)
+To verify first:          3.0 vCPU (7%), not counted in the potential
+
+Phase 1: Ready now
+  ...
+Phase 2: Ready after changes
+  1. shop/deployment/api (8.0 vCPU)
+       GR010  Point the workload at a NodePool that can provision arm64, or create one.
+       GR004  Build and push a multi-arch image, or pin the workload to amd64 until it is.
+```
+
+- **Ready now:** no blocker, no caveat, and every image runs on arm64. The safest first move, and a
+  good pilot.
+- **Ready after a check:** ready, with a caveat a person has to look at (an architecture written in
+  a command, a GPU).
+- **Ready after changes:** blockers that a change in the manifest or in the image build removes. They
+  are ordered by the CPU that would move divided by the number of changes, so a big workload that
+  needs one change goes before a small one that needs four. It is a way to order the work, not a
+  forecast of savings.
+- **Verify first:** nothing blocks it in the configuration, but its images were not checked or the
+  registry did not answer. Never counted in the potential.
+- **Keep on amd64:** needs an architecture that Graviton does not have (Windows). No change fixes it.
+
+## SARIF and code scanning
+
+`-f sarif` writes a SARIF 2.1.0 log for GitHub code scanning. Each finding points at the **line of
+the field that caused it**: the `image:` of GR003 to GR005, the node selector of GR001, GR002 and
+GR010, the label of a pool. The fingerprint ignores the line, so an alert survives an edit that
+moves the manifest. A workload read from a cluster has no file and carries the workload as a
+logical location. The output was validated against the official SARIF 2.1.0 schema.
+
+`--json-file`, `--sarif-file` and `--plan-file` write the other reports from the same run, so the
+registries are asked once.
+
+## Live cluster
+
+`--cluster` reads the Deployments, StatefulSets, DaemonSets, CronJobs, Argo Rollouts, Karpenter
+NodePools and EC2NodeClasses, and the nodes, from the cluster instead of from files.
+
+```bash
+graviton-readiness scan --cluster                                  # the current kubeconfig context
+graviton-readiness scan --cluster --context prod -n shop           # one context, one namespace
+graviton-readiness plan --cluster --check-images
+```
+
+It is **read-only**: only `list` calls are ever sent (the tests check that no other verb is used),
+paged by 500 objects and limited to a few requests a second, one resource at a time. A resource that
+is not installed is skipped with a note. `-n` limits the workloads; NodePools, EC2NodeClasses and
+nodes belong to the cluster and are always read whole. Jobs and Pods are not read: almost every one
+belongs to a controller that is. The minimum RBAC is `list` on `deployments`, `statefulsets` and
+`daemonsets` (apps), `cronjobs` (batch), `rollouts` (argoproj.io), `nodepools` (karpenter.sh),
+`ec2nodeclasses` (karpenter.k8s.aws) and `nodes` (core).
+
+**Pools that are not Karpenter's need no `--node-pool` in this mode.** The labels of the nodes give
+their architecture: an EKS managed node group, a GKE or AKS node pool is resolved from what its nodes
+report, and the message says it was observed (`observed on the cluster: all 2 node(s) labeled
+eks.amazonaws.com/nodegroup=core are amd64`). It is a statement about the nodes that exist today: a
+pool scaled to zero says nothing, and a pool with both architectures does not block. The same works
+for a file made with `kubectl get nodes -o yaml`.
+
+## GitHub Action
+
+The repository is also a GitHub Action: it installs the release that matches its version (checking
+the checksum), scans, adds the report to the job summary and, optionally, comments on the pull
+request, uploads the SARIF and fails the job.
+
+```yaml
+name: graviton-readiness
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write      # to comment
+  security-events: write    # to upload the SARIF
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4     # the registry login, if the images are private
+        with: {role-to-assume: "arn:aws:iam::123456789012:role/ci-read-ecr", aws-region: us-east-1}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: robertasolimandonofreo/graviton-readiness@v0.3.0
+        with:
+          path: ./k8s ./karpenter
+          check-images: "true"
+          comment: "true"
+          comment-plan: "true"
+          upload-sarif: "true"
+          fail-on: not-ready
+```
+
+| Input | Default | |
+| --- | --- | --- |
+| `path` | `.` | Files or directories to scan, separated by spaces. Put the NodePools in it too |
+| `check-images` | `false` | Read the image platforms. The credentials are the ones in the Docker config, so log in first |
+| `node-pool` | empty | Pools that are not Karpenter's, one `key=value:arch` per line |
+| `fail-on` | empty | `not-ready`, `unverified` or `caveats`. The comment is posted first |
+| `comment`, `comment-plan` | `false` | Comment the report, and a second comment with the plan; each is found by its marker and kept updated |
+| `upload-sarif` | `false` | Upload the SARIF to code scanning (needs `security-events: write`) |
+| `version` | the action's version | A release such as `v0.3.0`; `local` uses the binary on the `PATH` |
+| `github-token` | `github.token` | Token used to comment |
+
+Outputs: `potential-percent`, `ready`, `caveats`, `not-ready`, `unverified` and `sarif-file`. It runs
+on Linux and macOS runners. One run writes every report, so the registries are asked once. The
+comments are found by their markers, so the action never edits the comment of another tool. On pull
+requests from forks `GITHUB_TOKEN` is read-only, so `comment` and `upload-sarif` fail there.
+
 ## What the numbers mean
 
 The summary weighs the verdicts by the CPU the workloads request. The figures cover long-running
@@ -169,10 +298,12 @@ entry per workload with its score, verdict, findings and image statuses.
   image was published for arm64, not that it works.
 - **Performance and cost are out of scope.** It does not measure whether Graviton is cheaper for
   your workload, only whether it can run there.
-- Manifests only: it does not read a live cluster or Helm values yet. Render charts with
-  `helm template` and pipe them in. Only Karpenter NodePools are read from manifests: other pools
-  are declared with `--node-pool`. EC2NodeClass is not read, so an AMI that decides the
-  architecture is not seen.
+- No Helm values: render charts with `helm template` and pipe them in. Only Karpenter NodePools are
+  read from manifests; with `--cluster` the other pools come from the nodes, and from files they are
+  declared with `--node-pool`.
+- EC2NodeClass is read for what a manifest proves: a Windows AMI family means amd64 only. The
+  architecture of a custom AMI (`amiFamily: Custom`, an AMI chosen by id or tags) is in AWS, not in
+  the manifest, and is not read.
 - Rules are heuristics. GR006 looks for the text `amd64` or `x86_64`, so it can miss a hidden
   architecture or flag a harmless mention.
 - AWS first: the instance-type rules know Graviton families (m7g, c6gn, x2gd, im4gn, is4gen, g5g,
@@ -180,9 +311,9 @@ entry per workload with its score, verdict, findings and image statuses.
 
 ## Roadmap
 
-Reading a live cluster (read-only), reading EC2NodeClasses, a GitHub Action with a pull request
-comment, SARIF, and a migration plan that groups what to move now and after changes. None of it is
-started.
+Reading Helm values (the `values.yaml` that pins `kubernetes.io/arch`), asking AWS for the
+architecture of a custom AMI, and comparing with the base branch of a pull request so that only a
+new finding fails the build. None of it is started.
 
 ## Related
 
