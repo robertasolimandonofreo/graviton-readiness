@@ -41,7 +41,8 @@ Usage:
   graviton-readiness version
 
 Scan flags:
-  -f, --format <table|json|markdown>   output format (default table)
+  -f, --format <table|json|markdown|sarif>
+                                       output format (default table); sarif is for GitHub Code Scanning
       --check-images                   read the platforms of every image from its registry
       --fail-on <not-ready|unverified|caveats>
                                        exit 1 when a workload reaches this level
@@ -133,9 +134,9 @@ func scan(args []string, env Env) int {
 		return exitUsage
 	}
 	switch f.format {
-	case "table", "json", "markdown", "md":
+	case "table", "json", "markdown", "md", "sarif":
 	default:
-		fmt.Fprintf(env.Stderr, "unknown format %q (use table, json or markdown)\n", f.format)
+		fmt.Fprintf(env.Stderr, "unknown format %q (use table, json, markdown or sarif)\n", f.format)
 		return exitUsage
 	}
 	switch f.failOn {
@@ -212,6 +213,8 @@ func scan(args []string, env Env) int {
 	switch f.format {
 	case "json":
 		werr = report.JSON(env.Stdout, assessments, inv.Skipped, ro)
+	case "sarif":
+		werr = report.SARIF(env.Stdout, assessments, ro)
 	case "markdown", "md":
 		werr = report.Markdown(env.Stdout, assessments, inv.Skipped, ro)
 	default:

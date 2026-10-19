@@ -34,6 +34,9 @@ type Finding struct {
 	Rule     string   `json:"rule"`
 	Severity Severity `json:"severity"`
 	Message  string   `json:"message"`
+	// Hint is a piece of text that the field causing the finding contains (an image reference, a
+	// label key), so a report can point at its line in the manifest. It is not part of the JSON.
+	Hint string `json:"-"`
 }
 
 // ImageStatus is what is known about one image of the workload.
@@ -89,26 +92,26 @@ type Options struct {
 // said; it is empty when images were not checked.
 func Evaluate(w inventory.Workload, images map[string]image.Result, opts Options) Assessment {
 	a := Assessment{Workload: w, Findings: []Finding{}}
-	add := func(rule string, sev Severity, format string, args ...any) {
-		a.Findings = append(a.Findings, Finding{Rule: rule, Severity: sev, Message: fmt.Sprintf(format, args...)})
+	add := func(rule string, sev Severity, hint, format string, args ...any) {
+		a.Findings = append(a.Findings, Finding{Rule: rule, Severity: sev, Hint: hint, Message: fmt.Sprintf(format, args...)})
 	}
 
 	// Scheduling constraints.
 	if !allowsArch(w.Pod, "arm64") {
-		add("GR001", Blocker, "pinned to amd64: %s", archConstraint(w.Pod))
+		add("GR001", Blocker, "kubernetes.io/arch", "pinned to amd64: %s", archConstraint(w.Pod))
 	}
 	if what := pinnedToX86Types(w.Pod); what != "" {
-		add("GR002", Blocker, "only x86 instance types allowed: %s", what)
+		add("GR002", Blocker, "instance-", "only x86 instance types allowed: %s", what)
 	}
 	if targetsWindows(w.Pod) {
-		add("GR009", Blocker, "targets Windows nodes, which Graviton does not have")
+		add("GR009", Blocker, "windows", "targets Windows nodes, which Graviton does not have")
 	}
 	pinned := !allowsArch(w.Pod, "arm64")
 	// A pod that selects a NodePool has that pool's architecture. When the pod already pins
 	// amd64 itself (GR001) the pool adds nothing to say.
 	if !pinned {
 		if rule, sev, msg := poolFindings(w.Pod, opts.NodePools); rule != "" {
-			add(rule, sev, "%s", msg)
+			add(rule, sev, poolHint(w.Pod), "%s", msg)
 		}
 	}
 
@@ -117,7 +120,7 @@ func Evaluate(w inventory.Workload, images map[string]image.Result, opts Options
 	for _, c := range w.Containers() {
 		status := ImageStatus{Container: c.Name, Image: c.Image}
 		if what := namesAmd64(c.Image); what != "" {
-			add("GR003", Blocker, "container %q: image %s names an amd64 build (%s)", c.Name, c.Image, what)
+			add("GR003", Blocker, c.Image, "container %q: image %s names an amd64 build (%s)", c.Name, c.Image, what)
 		}
 		switch res, ok := images[c.Image]; {
 		case !opts.ImagesChecked:
@@ -126,28 +129,28 @@ func Evaluate(w inventory.Workload, images map[string]image.Result, opts Options
 		case !ok || res.Status == image.Unknown:
 			status.Status, status.Detail = string(image.Unknown), res.Describe()
 			unverified = true
-			add("GR005", Info, "container %q: image %s: %s", c.Name, c.Image, res.Describe())
+			add("GR005", Info, c.Image, "container %q: image %s: %s", c.Name, c.Image, res.Describe())
 		case res.Status == image.NoArm64:
 			status.Status, status.Detail = string(image.NoArm64), res.Describe()
 			msg := "container %q: image %s has no linux/arm64 manifest (has %s)"
 			if !pinned {
 				msg += "; it is not pinned to amd64, so it can land on an arm64 node and fail"
 			}
-			add("GR004", Blocker, msg, c.Name, c.Image, strings.Join(res.Platforms, ", "))
+			add("GR004", Blocker, c.Image, msg, c.Name, c.Image, strings.Join(res.Platforms, ", "))
 		default:
 			status.Status = string(image.Arm64)
 		}
 		a.Images = append(a.Images, status)
 
-		if hint := x86Mention(c); hint != "" {
-			add("GR006", Caveat, "container %q mentions %q in its command, args or environment", c.Name, hint)
+		if token := x86Mention(c); token != "" {
+			add("GR006", Caveat, token, "container %q mentions %q in its command, args or environment", c.Name, token)
 		}
 		if requestsGPU(c) {
-			add("GR007", Caveat, "container %q requests a GPU", c.Name)
+			add("GR007", Caveat, "/gpu", "container %q requests a GPU", c.Name)
 		}
 	}
 	if w.Kind == "DaemonSet" {
-		add("GR008", Info, "runs on every node, so its images must be multi-arch before any Graviton node joins")
+		add("GR008", Info, "", "runs on every node, so its images must be multi-arch before any Graviton node joins")
 	}
 
 	sortFindings(a.Findings)

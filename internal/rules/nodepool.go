@@ -294,3 +294,22 @@ func PoolCounts(pools []inventory.NodePool) (total, arm64 int) {
 	}
 	return total, arm64
 }
+
+// poolHint is the text to look for in the manifest to find the line where the pod picks its pool:
+// the karpenter.sh/nodepool selector, or else the first label it selects that is its own.
+func poolHint(pod corev1.PodSpec) string {
+	if UsesNodePoolSelector(pod) {
+		return nodePoolKey
+	}
+	keys := make([]string, 0, len(pod.NodeSelector))
+	for k := range pod.NodeSelector {
+		if customKey(k) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return "nodeSelector"
+}

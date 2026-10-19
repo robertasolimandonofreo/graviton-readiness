@@ -196,3 +196,67 @@ func TestSkippedFileDoesNotLeaveNodePoolsBehind(t *testing.T) {
 		t.Errorf("pools = %+v, unreadable = %+v, err = %v", inv.NodePools, inv.Unreadable, err)
 	}
 }
+
+func TestDocumentsKnowTheirLine(t *testing.T) {
+	text := `# a comment
+apiVersion: v1
+kind: Pod
+metadata: {name: first}
+spec:
+  containers:
+    - name: c
+      image: first:1
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: second}
+spec:
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+    - name: c
+      image: second:2
+`
+	inv := load(t, text)
+	if len(inv.Workloads) != 2 {
+		t.Fatalf("workloads = %d", len(inv.Workloads))
+	}
+	lines := strings.Split(text, "\n")
+	at := func(line int) string { return strings.TrimSpace(lines[line-1]) }
+	first, second := inv.Workloads[0], inv.Workloads[1]
+	if first.Line != 1 || second.Line != 9 {
+		t.Errorf("documents start at lines %d and %d, want 1 and 9", first.Line, second.Line)
+	}
+	// Every line that LineOf returns holds the text that was asked for.
+	for _, c := range []struct {
+		w      Workload
+		needle string
+	}{{first, "image:"}, {second, "image:"}, {second, "kubernetes.io/arch"}, {second, "NODESELECTOR"}} {
+		line := c.w.LineOf(c.needle)
+		if line == 0 || !strings.Contains(strings.ToLower(at(line)), strings.ToLower(c.needle)) {
+			t.Errorf("%s: LineOf(%q) = %d, which holds %q", c.w.Name, c.needle, line, at(line))
+		}
+	}
+	// With nothing to look for, or nothing found, the line of the kind: is returned.
+	if l := second.LineOf(""); at(l) != "kind: Pod" || l != 11 {
+		t.Errorf("LineOf(\"\") = %d (%q)", l, at(l))
+	}
+	if l := second.LineOf("not in the manifest"); l != 11 {
+		t.Errorf("a missing needle falls back to the kind: line, got %d", l)
+	}
+	// A second image lookup finds the line of that document, not of the first one.
+	if second.LineOf("image:") <= first.LineOf("image:") {
+		t.Error("the second document's image is below the first's")
+	}
+	if (Workload{}).LineOf("x") != 0 {
+		t.Error("a workload without a file has no line")
+	}
+}
+
+func TestJSONFileAndListKeepALine(t *testing.T) {
+	inv := load(t, `{"apiVersion":"v1","kind":"List","items":[
+  {"apiVersion":"v1","kind":"Pod","metadata":{"name":"a"},"spec":{"containers":[{"name":"c","image":"a:1"}]}}]}`)
+	if len(inv.Workloads) != 1 || inv.Workloads[0].Line != 1 {
+		t.Errorf("workloads = %+v", inv.Workloads)
+	}
+}
