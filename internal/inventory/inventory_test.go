@@ -260,3 +260,77 @@ func TestJSONFileAndListKeepALine(t *testing.T) {
 		t.Errorf("workloads = %+v", inv.Workloads)
 	}
 }
+
+func TestEC2NodeClassesAndLinking(t *testing.T) {
+	inv := load(t, `
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata: {name: win}
+spec:
+  template:
+    spec:
+      nodeClassRef: {group: karpenter.k8s.aws, kind: EC2NodeClass, name: windows}
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: [amd64, arm64]}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata: {name: linux}
+spec:
+  template:
+    spec:
+      nodeClassRef: {name: default}
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: [amd64, arm64]}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata: {name: alias}
+spec:
+  template:
+    spec:
+      nodeClassRef: {name: aliased}
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata: {name: windows}
+spec: {amiFamily: Windows2022}
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata: {name: default}
+spec:
+  amiSelectorTerms: [{alias: al2023@latest}]
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata: {name: aliased}
+spec:
+  amiSelectorTerms: [{alias: windows2019@latest}]
+---
+apiVersion: other.example.com/v1
+kind: EC2NodeClass
+metadata: {name: not-karpenter}
+spec: {amiFamily: Windows2022}
+`)
+	if len(inv.NodeClasses) != 3 || len(inv.NodePools) != 3 {
+		t.Fatalf("classes %d, pools %d", len(inv.NodeClasses), len(inv.NodePools))
+	}
+	if inv.NodePools[0].NodeClass != "windows" {
+		t.Errorf("nodeClassRef = %q", inv.NodePools[0].NodeClass)
+	}
+	if !inv.NodeClasses[0].Windows() || inv.NodeClasses[1].Windows() || !inv.NodeClasses[2].Windows() {
+		t.Error("Windows2022 and a windows2019@latest alias are Windows; al2023@latest is not")
+	}
+	inv.LinkNodeClasses()
+	extra := func(i int) int { return len(inv.NodePools[i].Requirements) }
+	if extra(0) != 2 || inv.NodePools[0].Requirements[1].Reason == "" || !strings.Contains(inv.NodePools[0].Requirements[1].Reason, "Windows") {
+		t.Errorf("the Windows pool must get a requirement with a reason: %+v", inv.NodePools[0].Requirements)
+	}
+	if extra(1) != 1 {
+		t.Errorf("a Linux class adds nothing: %+v", inv.NodePools[1].Requirements)
+	}
+	if extra(2) != 1 || !strings.Contains(inv.NodePools[2].Requirements[0].Reason, "windows2019@latest") {
+		t.Errorf("an alias is a Windows AMI too: %+v", inv.NodePools[2].Requirements)
+	}
+}

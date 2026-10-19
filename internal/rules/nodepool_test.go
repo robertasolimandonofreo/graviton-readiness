@@ -166,3 +166,37 @@ func TestLabelOnlyPoolIsNotMatchedByName(t *testing.T) {
 		t.Error("the pool is declared, so it is not unknown")
 	}
 }
+
+func TestWindowsNodeClassMakesAPoolAmd64Only(t *testing.T) {
+	inv := inventory.New()
+	for _, doc := range []string{
+		`{"apiVersion":"karpenter.sh/v1","kind":"NodePool","metadata":{"name":"win"},"spec":{"template":{"metadata":{"labels":{"role":"win"}},"spec":{"nodeClassRef":{"name":"windows"},"requirements":[{"key":"kubernetes.io/arch","operator":"In","values":["amd64","arm64"]}]}}}}`,
+		`{"apiVersion":"karpenter.sh/v1","kind":"NodePool","metadata":{"name":"lin"},"spec":{"template":{"metadata":{"labels":{"role":"lin"}},"spec":{"nodeClassRef":{"name":"default"},"requirements":[{"key":"kubernetes.io/arch","operator":"In","values":["amd64","arm64"]}]}}}}`,
+		`{"apiVersion":"karpenter.k8s.aws/v1","kind":"EC2NodeClass","metadata":{"name":"windows"},"spec":{"amiFamily":"Windows2022"}}`,
+		`{"apiVersion":"karpenter.k8s.aws/v1","kind":"EC2NodeClass","metadata":{"name":"default"},"spec":{"amiFamily":"AL2023"}}`,
+	} {
+		if err := inv.AddJSON("x", []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inv.LinkNodeClasses()
+	win := Evaluate(deployment(t, "Deployment", podWith("nodeSelector:\n  role: win\n")), nil, Options{NodePools: inv.NodePools})
+	var msg string
+	for _, f := range win.Findings {
+		if f.Rule == "GR010" {
+			msg = f.Message
+		}
+	}
+	if !strings.Contains(msg, "EC2NodeClass windows uses a Windows AMI") {
+		t.Errorf("GR010 must explain the Windows class: %q (%+v)", msg, win.Findings)
+	}
+	lin := Evaluate(deployment(t, "Deployment", podWith("nodeSelector:\n  role: lin\n")), nil, Options{NodePools: inv.NodePools})
+	for _, f := range lin.Findings {
+		if f.Rule == "GR010" {
+			t.Errorf("a Linux class must not block: %s", f.Message)
+		}
+	}
+	if n, arm := PoolCounts(inv.NodePools); n != 2 || arm != 1 {
+		t.Errorf("counts = %d, %d; want 2 pools of which 1 can provision arm64", n, arm)
+	}
+}
