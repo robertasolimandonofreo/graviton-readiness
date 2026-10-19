@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -287,5 +288,62 @@ func TestSARIFFormat(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(out), &doc); err != nil || doc.Version != "2.1.0" || len(doc.Runs[0].Results) == 0 {
 		t.Errorf("%v: %.200s", err, out)
+	}
+}
+
+func TestPlanCommand(t *testing.T) {
+	code, out, _ := run(t, "", nil, "plan", sample)
+	if code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	for _, want := range []string{"GRAVITON MIGRATION PLAN", "Ready after changes:", "Verify first:", "shop/deployment/api", "GR001", "Images were not checked"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	// --check-images with a registry that knows the images moves the workloads between groups.
+	c := fakeChecker{
+		"public.ecr.aws/nginx/nginx:1.27":             {Status: image.Arm64},
+		"registry.example.com/shop/report:7":          {Status: image.Arm64},
+		"registry.example.com/platform/log-agent:4.1": {Status: image.Arm64},
+	}
+	_, out, _ = run(t, "", c, "plan", sample, "--check-images")
+	if !regexp.MustCompile(`Ready now:\s+3\n`).MatchString(out) || !regexp.MustCompile(`Verify first:\s+0\n`).MatchString(out) {
+		t.Errorf("with the images verified, 3 workloads are ready now and none is left to verify:\n%s", out)
+	}
+	if strings.Contains(out, "Images were not checked") {
+		t.Errorf("they were checked:\n%s", out)
+	}
+}
+
+func TestPlanFormatsAndFlags(t *testing.T) {
+	_, out, _ := run(t, "", nil, "plan", sample, "-f", "json")
+	var doc struct {
+		SchemaVersion int `json:"schemaVersion"`
+		Totals        struct {
+			Total int `json:"total"`
+		} `json:"totals"`
+		Groups map[string][]struct {
+			ID      string `json:"id"`
+			Changes []struct {
+				Rule string `json:"rule"`
+			} `json:"changes"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil || doc.SchemaVersion != 1 || doc.Totals.Total != 5 {
+		t.Fatalf("%v: %.200s", err, out)
+	}
+	if len(doc.Groups["ready-after-changes"]) != 2 || doc.Groups["ready-after-changes"][0].ID != "shop/deployment/api" || len(doc.Groups["ready-now"]) != 0 {
+		t.Errorf("groups = %+v", doc.Groups)
+	}
+	if _, md, _ := run(t, "", nil, "plan", sample, "-f", "markdown"); !strings.HasPrefix(md, "<!-- graviton-readiness-plan -->") || !strings.Contains(md, "### Ready after changes (2)") {
+		t.Errorf("markdown:\n%s", md)
+	}
+	// sarif belongs to scan, and --fail-on belongs to scan.
+	if code, _, _ := run(t, "", nil, "plan", sample, "-f", "sarif"); code != exitUsage {
+		t.Errorf("plan has no sarif format, exit %d", code)
+	}
+	if code, _, errOut := run(t, "", nil, "plan", sample, "--fail-on", "not-ready"); code != exitUsage || !strings.Contains(errOut, "belongs to scan") {
+		t.Errorf("exit %d: %q", code, errOut)
 	}
 }
