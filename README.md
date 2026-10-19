@@ -3,7 +3,7 @@
 Graviton readiness check for Kubernetes. It tells you which workloads can move to AWS Graviton
 (arm64) nodes, and what blocks the ones that cannot.
 
-"Move to Graviton for up to 20% better price-performance" is common advice. Finding out which
+"Move to Graviton" is common advice. Finding out which
 workloads can actually run on arm64 is usually a guess, and the wrong guess is a pod that crash
 loops with `exec format error`. `graviton-readiness` reads your Deployments, StatefulSets,
 DaemonSets, Jobs, CronJobs and Pods and checks the two things that decide it: whether the
