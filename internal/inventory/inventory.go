@@ -94,6 +94,24 @@ type Inventory struct {
 	// NodeClasses are the Karpenter EC2NodeClasses found next to the NodePools. A pool that uses a
 	// Windows AMI family cannot provision arm64 nodes, whatever its own requirements say.
 	NodeClasses []EC2NodeClass
+	// Nodes are the nodes of a cluster (read live, or from kubectl get nodes -o yaml). Their labels
+	// tell the architecture of the pools that are not Karpenter NodePools: an EKS managed node
+	// group, a GKE or AKS node pool.
+	Nodes []Node
+}
+
+// Node is the part of a node that tells where a pod selected by label can run.
+type Node struct {
+	Name   string
+	Labels map[string]string
+}
+
+// Arch is the architecture the node reports, or "" when it does not say.
+func (n Node) Arch() string {
+	if a := n.Labels["kubernetes.io/arch"]; a != "" {
+		return a
+	}
+	return n.Labels["beta.kubernetes.io/arch"]
 }
 
 // EC2NodeClass is the part of a Karpenter EC2NodeClass that decides which AMI a node gets.
@@ -180,12 +198,12 @@ func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 			}
 			// A file named on the command line must parse. One found in a directory may be
 			// a template or a values file, so it is skipped, and nothing it held is kept.
-			before, pools, classes, skipped := len(inv.Workloads), len(inv.NodePools), len(inv.NodeClasses), maps.Clone(inv.Skipped)
+			before, pools, classes, nodes, skipped := len(inv.Workloads), len(inv.NodePools), len(inv.NodeClasses), len(inv.Nodes), maps.Clone(inv.Skipped)
 			if err := inv.Add(path, data); err != nil {
 				if path == p {
 					return fmt.Errorf("%s: %w", path, err)
 				}
-				inv.Workloads, inv.NodePools, inv.NodeClasses, inv.Skipped = inv.Workloads[:before], inv.NodePools[:pools], inv.NodeClasses[:classes], skipped
+				inv.Workloads, inv.NodePools, inv.NodeClasses, inv.Nodes, inv.Skipped = inv.Workloads[:before], inv.NodePools[:pools], inv.NodeClasses[:classes], inv.Nodes[:nodes], skipped
 				inv.Unreadable = append(inv.Unreadable, Unreadable{Path: path, Reason: firstLine(err)})
 			}
 			return nil
@@ -369,6 +387,39 @@ func (inv *Inventory) addObject(src source, raw json.RawMessage) error {
 			pool.Requirements = append(pool.Requirements, Requirement{Key: r.Key, Operator: r.Operator, Values: r.Values})
 		}
 		inv.NodePools = append(inv.NodePools, pool)
+	case "Node":
+		if meta.APIVersion != "v1" {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		inv.Nodes = append(inv.Nodes, Node{Name: o.Metadata.Name, Labels: o.Metadata.Labels})
+	case "Rollout":
+		// Argo Rollouts: a Deployment with a different strategy.
+		if !strings.HasPrefix(meta.APIVersion, "argoproj.io/") {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				Replicas *int32                 `json:"replicas"`
+				Template corev1.PodTemplateSpec `json:"template"`
+			} `json:"spec"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		if len(o.Spec.Template.Spec.Containers) == 0 {
+			// A Rollout that points at a Deployment (workloadRef) has no template of its own: the
+			// Deployment is the workload that gets analyzed.
+			inv.Skipped["Rollout (workloadRef)"]++
+			return nil
+		}
+		add("Rollout", o.Metadata, o.Spec.Replicas, true, o.Spec.Template.Spec)
 	case "EC2NodeClass":
 		if !strings.HasPrefix(meta.APIVersion, "karpenter.k8s.aws/") {
 			return nil
