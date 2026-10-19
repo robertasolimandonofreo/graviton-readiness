@@ -50,7 +50,11 @@ func poolArch(p inventory.NodePool) PoolArch {
 				}
 			}
 			if a != before {
-				reasons = append(reasons, fmt.Sprintf("%s %s [%s]", r.Key, r.Operator, strings.Join(r.Values, ", ")))
+				if r.Reason != "" {
+					reasons = append(reasons, r.Reason)
+				} else {
+					reasons = append(reasons, fmt.Sprintf("%s %s [%s]", r.Key, r.Operator, strings.Join(r.Values, ", ")))
+				}
 			}
 		case r.Operator == "In" && len(r.Values) > 0 && (contains(instanceTypeKeys, r.Key) || r.Key == instanceFamilyKey):
 			var graviton, x86 bool

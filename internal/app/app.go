@@ -186,6 +186,7 @@ func scan(args []string, env Env) int {
 		results = image.CheckAll(ctx, checker, rules.ImageRefs(inv.Workloads), f.concurrency)
 	}
 
+	inv.LinkNodeClasses()
 	pools := inv.NodePools
 	for _, spec := range f.nodePools {
 		pool, err := rules.ParsePool(spec)

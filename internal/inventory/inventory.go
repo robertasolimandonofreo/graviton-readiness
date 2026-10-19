@@ -91,6 +91,32 @@ type Inventory struct {
 	// NodePools are the Karpenter NodePools found next to the workloads. A workload that selects
 	// a pool by label has the architecture of that pool, which the pod itself does not say.
 	NodePools []NodePool
+	// NodeClasses are the Karpenter EC2NodeClasses found next to the NodePools. A pool that uses a
+	// Windows AMI family cannot provision arm64 nodes, whatever its own requirements say.
+	NodeClasses []EC2NodeClass
+}
+
+// EC2NodeClass is the part of a Karpenter EC2NodeClass that decides which AMI a node gets.
+type EC2NodeClass struct {
+	Name string
+	// AMIFamily is spec.amiFamily (AL2, AL2023, Bottlerocket, Windows2022, Custom...).
+	AMIFamily string
+	// Aliases are the alias terms of spec.amiSelectorTerms, such as al2023@latest.
+	Aliases []string
+	File    string
+}
+
+// Windows reports whether the class uses a Windows AMI, which only runs on amd64.
+func (c EC2NodeClass) Windows() bool {
+	if strings.HasPrefix(strings.ToLower(c.AMIFamily), "windows") {
+		return true
+	}
+	for _, a := range c.Aliases {
+		if strings.HasPrefix(strings.ToLower(a), "windows") {
+			return true
+		}
+	}
+	return false
 }
 
 // NodePool is the part of a Karpenter NodePool that decides which nodes it can provision.
@@ -98,7 +124,9 @@ type NodePool struct {
 	Name         string
 	Labels       map[string]string
 	Requirements []Requirement
-	File         string
+	// NodeClass is the name of the EC2NodeClass the pool uses (spec.template.spec.nodeClassRef).
+	NodeClass string
+	File      string
 	// LabelOnly marks a pool declared by label (--node-pool role=web:amd64): it has no name that
 	// karpenter.sh/nodepool could select.
 	LabelOnly bool
@@ -109,6 +137,9 @@ type Requirement struct {
 	Key      string
 	Operator string
 	Values   []string
+	// Reason explains a requirement that did not come from the pool itself but from something it
+	// uses (a Windows EC2NodeClass). It is shown in place of the requirement.
+	Reason string
 }
 
 // Unreadable is a file that was skipped, and why.
@@ -149,12 +180,12 @@ func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 			}
 			// A file named on the command line must parse. One found in a directory may be
 			// a template or a values file, so it is skipped, and nothing it held is kept.
-			before, pools, skipped := len(inv.Workloads), len(inv.NodePools), maps.Clone(inv.Skipped)
+			before, pools, classes, skipped := len(inv.Workloads), len(inv.NodePools), len(inv.NodeClasses), maps.Clone(inv.Skipped)
 			if err := inv.Add(path, data); err != nil {
 				if path == p {
 					return fmt.Errorf("%s: %w", path, err)
 				}
-				inv.Workloads, inv.NodePools, inv.Skipped = inv.Workloads[:before], inv.NodePools[:pools], skipped
+				inv.Workloads, inv.NodePools, inv.NodeClasses, inv.Skipped = inv.Workloads[:before], inv.NodePools[:pools], inv.NodeClasses[:classes], skipped
 				inv.Unreadable = append(inv.Unreadable, Unreadable{Path: path, Reason: firstLine(err)})
 			}
 			return nil
@@ -318,6 +349,9 @@ func (inv *Inventory) addObject(src source, raw json.RawMessage) error {
 						Labels map[string]string `json:"labels"`
 					} `json:"metadata"`
 					Spec struct {
+						NodeClassRef struct {
+							Name string `json:"name"`
+						} `json:"nodeClassRef"`
 						Requirements []struct {
 							Key      string   `json:"key"`
 							Operator string   `json:"operator"`
@@ -330,11 +364,34 @@ func (inv *Inventory) addObject(src source, raw json.RawMessage) error {
 		if err := decode(&o); err != nil {
 			return err
 		}
-		pool := NodePool{Name: o.Metadata.Name, Labels: o.Spec.Template.Metadata.Labels, File: src.file}
+		pool := NodePool{Name: o.Metadata.Name, Labels: o.Spec.Template.Metadata.Labels, NodeClass: o.Spec.Template.Spec.NodeClassRef.Name, File: src.file}
 		for _, r := range o.Spec.Template.Spec.Requirements {
 			pool.Requirements = append(pool.Requirements, Requirement{Key: r.Key, Operator: r.Operator, Values: r.Values})
 		}
 		inv.NodePools = append(inv.NodePools, pool)
+	case "EC2NodeClass":
+		if !strings.HasPrefix(meta.APIVersion, "karpenter.k8s.aws/") {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				AMIFamily        string `json:"amiFamily"`
+				AMISelectorTerms []struct {
+					Alias string `json:"alias"`
+				} `json:"amiSelectorTerms"`
+			} `json:"spec"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		c := EC2NodeClass{Name: o.Metadata.Name, AMIFamily: o.Spec.AMIFamily, File: src.file}
+		for _, t := range o.Spec.AMISelectorTerms {
+			if t.Alias != "" {
+				c.Aliases = append(c.Aliases, t.Alias)
+			}
+		}
+		inv.NodeClasses = append(inv.NodeClasses, c)
 	case "ReplicaSet", "ReplicationController":
 		// Owned by a Deployment in practice: counted so the report can say what was left out.
 		inv.Skipped[meta.Kind]++
@@ -357,4 +414,27 @@ func cpuRequest(pod corev1.PodSpec) int64 {
 		}
 	}
 	return total
+}
+
+// LinkNodeClasses applies what the EC2NodeClasses say to the NodePools that use them: a pool whose
+// class has a Windows AMI only provisions amd64, so a requirement that says so is added. Call it
+// once, after everything has been read.
+func (inv *Inventory) LinkNodeClasses() {
+	classes := map[string]EC2NodeClass{}
+	for _, c := range inv.NodeClasses {
+		classes[c.Name] = c
+	}
+	for i := range inv.NodePools {
+		p := &inv.NodePools[i]
+		c, ok := classes[p.NodeClass]
+		if !ok || !c.Windows() {
+			continue
+		}
+		family := c.AMIFamily
+		if family == "" && len(c.Aliases) > 0 {
+			family = c.Aliases[0]
+		}
+		p.Requirements = append(p.Requirements, Requirement{Key: "kubernetes.io/arch", Operator: "In", Values: []string{"amd64"},
+			Reason: fmt.Sprintf("EC2NodeClass %s uses a Windows AMI (%s), which only runs on amd64", c.Name, family)})
+	}
 }
