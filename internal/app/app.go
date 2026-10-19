@@ -12,6 +12,7 @@ import (
 
 	"github.com/robertasolimandonofreo/graviton-readiness/internal/image"
 	"github.com/robertasolimandonofreo/graviton-readiness/internal/inventory"
+	"github.com/robertasolimandonofreo/graviton-readiness/internal/plan"
 	"github.com/robertasolimandonofreo/graviton-readiness/internal/report"
 	"github.com/robertasolimandonofreo/graviton-readiness/internal/rules"
 )
@@ -37,6 +38,7 @@ const usage = `graviton-readiness tells which Kubernetes workloads can move to G
 
 Usage:
   graviton-readiness scan [flags] [paths...]   scan manifests (files, directories, or - for stdin)
+  graviton-readiness plan [flags] [paths...]   what to move now, after changes, or never
   graviton-readiness explain <rule>            describe a rule, for example GR004
   graviton-readiness version
 
@@ -66,6 +68,8 @@ func Run(args []string, env Env) int {
 	switch args[0] {
 	case "scan":
 		return scan(args[1:], env)
+	case "plan":
+		return planCommand(args[1:], env)
 	case "explain":
 		return explain(args[1:], env)
 	case "version", "--version":
@@ -112,9 +116,21 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	}
 }
 
-func scan(args []string, env Env) int {
+// session is everything that scan and plan share: the flags, what was read and the result of
+// the rules for every workload.
+type session struct {
+	flags       scanFlags
+	paths       []string
+	inv         *inventory.Inventory
+	assessments []rules.Assessment
+	ro          report.Options
+}
+
+// prepare parses the flags, reads the manifests, checks the images when asked and applies the
+// rules. It returns a nil session and an exit code when something stops the command.
+func prepare(command string, formats []string, args []string, env Env) (*session, int) {
 	var f scanFlags
-	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 	fs.StringVar(&f.format, "format", "table", "")
 	fs.StringVar(&f.format, "f", "table", "")
@@ -127,29 +143,34 @@ func scan(args []string, env Env) int {
 	fs.Var(&f.nodePools, "node-pool", "")
 	paths, err := parseInterspersed(fs, args)
 	if err != nil {
-		return exitUsage
+		return nil, exitUsage
+	}
+	fail := func(format string, a ...any) (*session, int) {
+		fmt.Fprintf(env.Stderr, format+"\n", a...)
+		return nil, exitUsage
 	}
 	if len(paths) == 0 {
-		fmt.Fprintln(env.Stderr, "scan needs at least one path (a file, a directory, or - for stdin)")
-		return exitUsage
+		return fail("%s needs at least one path (a file, a directory, or - for stdin)", command)
 	}
-	switch f.format {
-	case "table", "json", "markdown", "md", "sarif":
-	default:
-		fmt.Fprintf(env.Stderr, "unknown format %q (use table, json, markdown or sarif)\n", f.format)
-		return exitUsage
+	known := false
+	for _, name := range formats {
+		known = known || f.format == name
+	}
+	if !known {
+		return fail("unknown format %q (use %s)", f.format, strings.Join(formats, ", "))
 	}
 	switch f.failOn {
 	case "", "not-ready", "unverified", "caveats":
 	default:
-		fmt.Fprintf(env.Stderr, "unknown --fail-on %q (use not-ready, unverified or caveats)\n", f.failOn)
-		return exitUsage
+		return fail("unknown --fail-on %q (use not-ready, unverified or caveats)", f.failOn)
+	}
+	if command != "scan" && f.failOn != "" {
+		return fail("--fail-on belongs to scan: %s only plans", command)
 	}
 
 	inv, err := inventory.Paths(paths, env.Stdin)
 	if err != nil {
-		fmt.Fprintln(env.Stderr, "error:", err)
-		return exitUsage
+		return fail("error: %v", err)
 	}
 	if n := len(inv.Unreadable); n > 0 {
 		shown := inv.Unreadable
@@ -178,8 +199,7 @@ func scan(args []string, env Env) int {
 		if checker == nil {
 			d, err := parseTimeout(f.timeout)
 			if err != nil {
-				fmt.Fprintln(env.Stderr, "error:", err)
-				return exitUsage
+				return fail("error: %v", err)
 			}
 			checker = &image.Registry{Timeout: d}
 		}
@@ -191,8 +211,7 @@ func scan(args []string, env Env) int {
 	for _, spec := range f.nodePools {
 		pool, err := rules.ParsePool(spec)
 		if err != nil {
-			fmt.Fprintln(env.Stderr, "error:", err)
-			return exitUsage
+			return fail("error: %v", err)
 		}
 		pools = append(pools, pool)
 	}
@@ -209,23 +228,31 @@ func scan(args []string, env Env) int {
 			info.Unresolved++
 		}
 	}
-	ro := report.Options{Verbose: f.verbose, ImagesChecked: f.checkImages, Version: env.Version, Pools: info}
+	return &session{flags: f, paths: paths, inv: inv, assessments: assessments,
+		ro: report.Options{Verbose: f.verbose, ImagesChecked: f.checkImages, Version: env.Version, Pools: info}}, exitOK
+}
+
+func scan(args []string, env Env) int {
+	s, code := prepare("scan", []string{"table", "json", "markdown", "md", "sarif"}, args, env)
+	if s == nil {
+		return code
+	}
 	var werr error
-	switch f.format {
+	switch s.flags.format {
 	case "json":
-		werr = report.JSON(env.Stdout, assessments, inv.Skipped, ro)
+		werr = report.JSON(env.Stdout, s.assessments, s.inv.Skipped, s.ro)
 	case "sarif":
-		werr = report.SARIF(env.Stdout, assessments, ro)
+		werr = report.SARIF(env.Stdout, s.assessments, s.ro)
 	case "markdown", "md":
-		werr = report.Markdown(env.Stdout, assessments, inv.Skipped, ro)
+		werr = report.Markdown(env.Stdout, s.assessments, s.inv.Skipped, s.ro)
 	default:
-		werr = report.Table(env.Stdout, assessments, inv.Skipped, ro)
+		werr = report.Table(env.Stdout, s.assessments, s.inv.Skipped, s.ro)
 	}
 	if werr != nil {
 		fmt.Fprintln(env.Stderr, "error:", werr)
 		return exitUsage
 	}
-	if reached(assessments, f.failOn) {
+	if reached(s.assessments, s.flags.failOn) {
 		return exitFail
 	}
 	return exitOK
@@ -281,4 +308,27 @@ func indentLines(s, prefix string) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n")
+}
+
+// planCommand turns the verdicts into an order of work.
+func planCommand(args []string, env Env) int {
+	s, code := prepare("plan", []string{"table", "json", "markdown", "md"}, args, env)
+	if s == nil {
+		return code
+	}
+	p := plan.Build(s.assessments)
+	var werr error
+	switch s.flags.format {
+	case "json":
+		werr = report.PlanJSON(env.Stdout, p, s.ro)
+	case "markdown", "md":
+		werr = report.PlanMarkdown(env.Stdout, p, s.ro)
+	default:
+		werr = report.PlanTable(env.Stdout, p, s.ro)
+	}
+	if werr != nil {
+		fmt.Fprintln(env.Stderr, "error:", werr)
+		return exitUsage
+	}
+	return exitOK
 }

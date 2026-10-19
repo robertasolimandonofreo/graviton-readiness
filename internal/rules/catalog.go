@@ -60,7 +60,7 @@ values: [m5.2xlarge, m7g.2xlarge]`,
 		ID: "GR003", Severity: Blocker,
 		Title: "Image reference names an amd64 build",
 		Why:   "A tag such as 1.4-amd64, or a repository such as amd64/ubuntu, is an x86-only image. It starts on an arm64 node and fails with an exec format error.",
-		Fix:   "Use the multi-arch tag (1.4) or the arm64 build, and keep the tag identical across architectures so one manifest serves both.",
+		Fix:   "Use the multi-arch tag, the one without the architecture in it, or the arm64 build, and keep the tag identical across architectures so one manifest serves both.",
 		Example: `# problem
 image: registry.example.com/api:1.4-amd64
 # fix
