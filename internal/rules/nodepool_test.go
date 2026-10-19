@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/robertasolimandonofreo/graviton-readiness/internal/inventory"
 )
 
@@ -198,5 +200,65 @@ func TestWindowsNodeClassMakesAPoolAmd64Only(t *testing.T) {
 	}
 	if n, arm := PoolCounts(inv.NodePools); n != 2 || arm != 1 {
 		t.Errorf("counts = %d, %d; want 2 pools of which 1 can provision arm64", n, arm)
+	}
+}
+
+func podSpec(t *testing.T, selector string) corev1.PodSpec {
+	t.Helper()
+	return deployment(t, "Deployment", podWith(selector)).Pod
+}
+
+func nodes(arch map[string]string, label, value string) []inventory.Node {
+	var out []inventory.Node
+	for name, a := range arch {
+		out = append(out, inventory.Node{Name: name, Labels: map[string]string{label: value, "kubernetes.io/arch": a}})
+	}
+	return out
+}
+
+func TestObservedPools(t *testing.T) {
+	pod := podSpec(t, "nodeSelector:\n  eks.amazonaws.com/nodegroup: general\n")
+	eval := func(ns []inventory.Node, known ...inventory.NodePool) (string, []inventory.NodePool) {
+		pools := ObservedPools([]corev1.PodSpec{pod}, known, ns)
+		w := deployment(t, "Deployment", podWith("nodeSelector:\n  eks.amazonaws.com/nodegroup: general\n"))
+		got := Evaluate(w, nil, Options{NodePools: append(append([]inventory.NodePool{}, known...), pools...)})
+		var rules []string
+		for _, f := range got.Findings {
+			if f.Rule == "GR010" || f.Rule == "GR011" {
+				rules = append(rules, f.Rule)
+			}
+		}
+		return strings.Join(rules, ","), pools
+	}
+	const label = "eks.amazonaws.com/nodegroup"
+
+	if rules, pools := eval(nodes(map[string]string{"a": "amd64", "b": "amd64"}, label, "general")); rules != "GR010" || len(pools) != 1 {
+		t.Errorf("a node group of amd64 nodes blocks: %q %+v", rules, pools)
+	} else if r := pools[0].Requirements[0].Reason; !strings.Contains(r, "observed on the cluster: all 2 node(s) labeled eks.amazonaws.com/nodegroup=general are amd64") {
+		t.Errorf("the message says it is an observation: %q", r)
+	}
+	if rules, _ := eval(nodes(map[string]string{"a": "arm64"}, label, "general")); rules != "" {
+		t.Errorf("arm64 nodes do not block: %q", rules)
+	}
+	if rules, _ := eval(nodes(map[string]string{"a": "amd64", "b": "arm64"}, label, "general")); rules != "" {
+		t.Errorf("a group with both architectures does not block: %q", rules)
+	}
+	// No node has the label: a group scaled to zero says nothing, so no pool is made.
+	if rules, pools := eval(nodes(map[string]string{"a": "amd64"}, label, "another")); len(pools) != 0 || rules != "GR011" && rules != "" {
+		t.Errorf("no node has the label: pools %v rules %q", pools, rules)
+	}
+	if got := ObservedPools([]corev1.PodSpec{pod}, nil, nil); got != nil {
+		t.Errorf("no nodes read, no pools: %+v", got)
+	}
+	// A pool that is already known answers for the label: the nodes are not asked.
+	known := inventory.NodePool{Name: "p", Labels: map[string]string{label: "general"}, LabelOnly: true}
+	if pools := ObservedPools([]corev1.PodSpec{pod}, []inventory.NodePool{known}, nodes(map[string]string{"a": "amd64"}, label, "general")); len(pools) != 0 {
+		t.Errorf("a known pool wins over what the nodes say: %+v", pools)
+	}
+	// The karpenter.sh/nodepool label of a pool whose manifest was not read.
+	npod := podSpec(t, "nodeSelector:\n  karpenter.sh/nodepool: web\n")
+	ns := nodes(map[string]string{"a": "amd64"}, "karpenter.sh/nodepool", "web")
+	if pools := ObservedPools([]corev1.PodSpec{npod}, nil, ns); len(pools) != 1 || pools[0].Name != "web" || pools[0].LabelOnly {
+		t.Errorf("a pool selected by name is named by it: %+v", pools)
 	}
 }

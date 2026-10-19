@@ -317,3 +317,79 @@ func poolHint(pod corev1.PodSpec) string {
 	}
 	return "nodeSelector"
 }
+
+// ObservedPools derives pools from the nodes of a cluster, for the pods that select nodes by a
+// label that no known pool answers for: an EKS managed node group, a GKE or AKS node pool. The
+// architecture is what the nodes with that label report today, so it is a statement about the
+// nodes that exist, and the message says so. A label that both architectures carry allows both.
+// Nothing is derived for a label that no node has: a pool scaled to zero says nothing.
+func ObservedPools(pods []corev1.PodSpec, known []inventory.NodePool, nodes []inventory.Node) []inventory.NodePool {
+	if len(nodes) == 0 {
+		return nil
+	}
+	type pair struct{ key, value string }
+	wanted := map[pair]bool{}
+	want := func(key, value string) {
+		if key == nodePoolKey || customKey(key) {
+			wanted[pair{key, value}] = true
+		}
+	}
+	for _, pod := range pods {
+		for k, v := range pod.NodeSelector {
+			want(k, v)
+		}
+		for _, term := range requiredTerms(pod) {
+			for _, e := range term.MatchExpressions {
+				if e.Operator == corev1.NodeSelectorOpIn {
+					for _, v := range e.Values {
+						want(e.Key, v)
+					}
+				}
+			}
+		}
+	}
+	answered := func(p pair) bool {
+		for _, kp := range known {
+			if v, ok := poolValue(kp, p.key); ok && v == p.value {
+				return true
+			}
+		}
+		return false
+	}
+	var keys []pair
+	for p := range wanted {
+		if !answered(p) {
+			keys = append(keys, p)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].key+"="+keys[i].value < keys[j].key+"="+keys[j].value })
+
+	var out []inventory.NodePool
+	for _, p := range keys {
+		arches := map[string]int{}
+		total := 0
+		for _, n := range nodes {
+			if n.Labels[p.key] == p.value {
+				total++
+				arches[n.Arch()]++
+			}
+		}
+		if total == 0 {
+			continue
+		}
+		pool := inventory.NodePool{Name: p.key + "=" + p.value, Labels: map[string]string{p.key: p.value}, LabelOnly: p.key != nodePoolKey}
+		if p.key == nodePoolKey {
+			pool.Name = p.value
+		}
+		if len(arches) == 1 {
+			for arch := range arches {
+				if arch == "amd64" || arch == "arm64" {
+					pool.Requirements = []inventory.Requirement{{Key: archKey, Operator: "In", Values: []string{arch},
+						Reason: fmt.Sprintf("observed on the cluster: all %d node(s) labeled %s=%s are %s", total, p.key, p.value, arch)}}
+				}
+			}
+		}
+		out = append(out, pool)
+	}
+	return out
+}

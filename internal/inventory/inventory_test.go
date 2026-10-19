@@ -334,3 +334,56 @@ spec: {amiFamily: Windows2022}
 		t.Errorf("an alias is a Windows AMI too: %+v", inv.NodePools[2].Requirements)
 	}
 }
+
+func TestNodesAndRollouts(t *testing.T) {
+	inv := load(t, `
+apiVersion: v1
+kind: Node
+metadata:
+  name: n1
+  labels: {kubernetes.io/arch: arm64, role: batch}
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: n2
+  labels: {beta.kubernetes.io/arch: amd64}
+---
+apiVersion: v1
+kind: Node
+metadata: {name: n3}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: canary, namespace: shop}
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers: [{name: app, image: a:1, resources: {requests: {cpu: 200m}}}]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: by-ref, namespace: shop}
+spec:
+  workloadRef: {apiVersion: apps/v1, kind: Deployment, name: api}
+---
+apiVersion: other.example.com/v1
+kind: Rollout
+metadata: {name: not-argo}
+spec:
+  template: {spec: {containers: [{name: c, image: c:1}]}}
+`)
+	if len(inv.Nodes) != 3 || inv.Nodes[0].Arch() != "arm64" || inv.Nodes[1].Arch() != "amd64" || inv.Nodes[2].Arch() != "" {
+		t.Errorf("nodes = %+v (the beta label counts, and a node may not say)", inv.Nodes)
+	}
+	if inv.Nodes[0].Labels["role"] != "batch" {
+		t.Error("labels are kept")
+	}
+	if len(inv.Workloads) != 1 || inv.Workloads[0].ID() != "shop/rollout/canary" || inv.Workloads[0].Replicas != 3 || !inv.Workloads[0].LongRunning {
+		t.Errorf("workloads = %+v (only the Argo Rollout with a template counts)", inv.Workloads)
+	}
+	if inv.Skipped["Rollout (workloadRef)"] != 1 {
+		t.Errorf("skipped = %v", inv.Skipped)
+	}
+}
