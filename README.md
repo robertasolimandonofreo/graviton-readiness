@@ -334,6 +334,11 @@ go run ./cmd/graviton-readiness scan testdata
 
 The image checks are tested against an in-memory registry, so the tests need no network.
 
+## More
+
+- Guide and examples: https://www.robertasoliman.com/en/tools/graviton-readiness
+- Article: https://www.robertasoliman.com/en/blog/graviton-readiness-which-workloads-run-on-graviton
+
 ## License
 
 Apache-2.0.
