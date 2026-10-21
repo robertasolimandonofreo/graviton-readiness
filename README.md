@@ -16,7 +16,13 @@ for `linux/arm64`.
 
 ## Install
 
-Download a binary for Linux, macOS or Windows (amd64 and arm64) from the
+With Homebrew (macOS and Linux):
+
+```bash
+brew install robertasolimandonofreo/tap/graviton-readiness
+```
+
+Or download a binary for Linux, macOS or Windows (amd64 and arm64) from the
 [releases page](https://github.com/robertasolimandonofreo/graviton-readiness/releases), and check it
 against `checksums.txt`:
 
