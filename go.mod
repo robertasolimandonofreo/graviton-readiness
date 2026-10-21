@@ -1,6 +1,6 @@
 module github.com/robertasolimandonofreo/graviton-readiness
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/google/go-containerregistry v0.22.1
