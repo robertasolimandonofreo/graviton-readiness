@@ -10,7 +10,7 @@ DaemonSets, Jobs, CronJobs and Pods and checks the two things that decide it: wh
 scheduling configuration lets the pod reach an arm64 node, and whether every image was published
 for `linux/arm64`.
 
-> **Status: early (v0.3.0).** It scans YAML/JSON manifests or a live cluster (read-only), reads the
+> **Status: early (v0.3.2).** It scans YAML/JSON manifests or a live cluster (read-only), reads the
 > platforms of the images from their registries, and plans the migration. It is a static analysis
 > of configuration, not a guarantee: see [Limits](#limits).
 
@@ -256,7 +256,7 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4     # the registry login, if the images are private
         with: {role-to-assume: "arn:aws:iam::123456789012:role/ci-read-ecr", aws-region: us-east-1}
       - uses: aws-actions/amazon-ecr-login@v2
-      - uses: robertasolimandonofreo/graviton-readiness@v0.3.0
+      - uses: robertasolimandonofreo/graviton-readiness@v0.3.2
         with:
           path: ./k8s ./karpenter
           check-images: "true"
